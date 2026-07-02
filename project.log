@@ -1,5 +1,15 @@
 # -*- mode: org -*-
 
+* [2026-07-02 Thu]
+
+[11:00]
+
+Found this project: https://penzai.readthedocs.io/en/v0.1.4/index.html
+
+It shows jax models in a better way so that it is easier to slice and
+dice it. Should investigate this as this is probably something that we
+want to do. Dependent on the project we might want to remove the
+visual part of the model.
 
 
 * [2026-07-01 Wed]
