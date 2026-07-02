@@ -1,0 +1,20 @@
+[project]
+name = "neurosym-expr-01"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Bjarte Johansen", email = "bjajoh@equinor.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "accelerate>=1.14.0",
+    "pillow>=12.2.0",
+    "torch>=2.12.1",
+    "torchvision>=0.27.1",
+    "transformers>=5.12.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
