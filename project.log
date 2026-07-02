@@ -1,0 +1,75 @@
+# -*- mode: org -*-
+
+
+
+* [2026-07-01 Wed]
+
+[13:58]
+
+I have been looking at different ways to include logic into the
+training of language models (preferably small).
+
+
+In my work I have observed that when we work with AI and language we
+often end up in a situation where we have good ideas and can find
+algorithms that can help us solve different problems in
+categorisation, information extraction, knowledge management, etc. We
+have a lot of data and knowledge about the data. The issue is that we
+do not have a lot of training data and no good ways of generating
+training data. The subject matter experts (SMEs) do not have the time
+or patience to annotate data. The annotated data often has low quality
+from a machine learning perspective as the SMEs get bored and/or do
+not understand how simple the task we are asking them to do is as they
+expect the AI system to be smart.
+
+What we would like to do is to be able to convert the knowledge about
+the data into logic that we can use in training and inference.
+
+This is why I have been investigating neurosymbolic approaches.
+
+Some of the key topics I have looked at are:
+ - Provenance semirings
+ - Datalog
+ - Differentiability
+ - Combinatorial exploration
+ - Probabilistic computation
+ - Recursion
+ - Scalability
+
+I have found the scallop-lang project. A programming language for
+working with neursymbolic computing. It is based on datalog and can
+interact with python.
+
+Another project is dolphin. It is a python package that uses
+"provenance semirings" to translate probabilities to symbolic
+execution with pytorch.
+
+As training time, computation, and scale is important, I tihnk the
+dolphin approach is closer to the right thing. I am thinking about how
+to combine it with prolog and constraint logic programming for finite
+domains.
+
+I also want to investigate how *xgrammar* handles the symbolic part of
+introducing the grammar.
+
+The first result from the project is an accepted pull request to
+scallop. A project built for neurosymbolic programming. I updated some
+of the dependencies. And made it compatible with python 3.14.
+
+I belive I want to do something similar to what dolphin is doing. I am
+not convinced it is "THE" way, but now I need to get a model running
+so that we can start to see what it would look like to get the model
+included in the project.
+
+
+Keywords for investigating later:
+    - xgrammar
+    - constraint logic programming
+    - tropical semirings
+    - probabilistic programming
+    - pyro
+    - Executing datalog with pytorch?
+
+
+First order of investigation:
+  - Can I get the diffusion gemma model running on my mac?
