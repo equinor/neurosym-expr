@@ -2,6 +2,15 @@
 
 * [2026-07-02 Thu]
 
+
+[11:13]
+
+I got gemma running on my mac, but it is very slow. Basically 10 min
+to get first iteration and it struggles to get to the second
+iteration. Pytorch seems to have a memory issue on mac so I can't take
+advantage of metal. The original gemma code is in jax so I'll have a
+try running that as well: https://github.com/google-deepmind/gemma
+
 [11:00]
 
 Found this project: https://penzai.readthedocs.io/en/v0.1.4/index.html
@@ -10,6 +19,8 @@ It shows jax models in a better way so that it is easier to slice and
 dice it. Should investigate this as this is probably something that we
 want to do. Dependent on the project we might want to remove the
 visual part of the model.
+
+
 
 
 * [2026-07-01 Wed]
