@@ -1,5 +1,41 @@
 # -*- mode: org -*-
 
+[2026-07-16 Thu]
+
+[16:03]
+
+There is an issue using diffusion text models and grammars. The
+[[https://github.com/mlc-ai/xgrammar][xgrammar]] library assumes that generation is one token at a time--like
+a transformer does--but the diffusion models generate a block at a
+time. I need a way to say how the text is _close_ to the grammar.
+
+I have been thinking about a couple of different ideas:
+    1. Just sample and validate the grammar
+    2. Do the same on a line basis
+    3. Evaluate each token as an anchor
+
+The issue with 1 is that most texts will be bad and I fear I will just
+end up in a local minimum that is far away from anything useful as it
+has to find a small step to be able to train at all. Inefficient.
+
+2 solves some of this--but feels wrong. I want to be able to say
+something about each "prediction".
+
+I think 3 is the correct direction--what if for any given token, we
+assumed that it could be anywhere in the grammar. Which tokens could
+it be? If that is right, what tokens could then it's neighbours be? Do
+this until we hit some limit:
+  - Artificial set k?
+  - Finished the current statement?
+  - Found a whole program?
+
+How do we sum or multiply the belief out afterwards to update the
+model? Can we use the same structures to resolve the final output at
+the end? Like they do in scallop and dolphin?
+
+My worry is that it can be slow. How is the sampling done and what can
+we do to speed it up?
+
 * [2026-07-02 Thu]
 
 [12:14] expr02
