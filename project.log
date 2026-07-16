@@ -1,6 +1,26 @@
 # -*- mode: org -*-
 
-[2026-07-16 Thu]
+* [2026-07-31 Fri]
+
+[15:48]
+
+I received the DGX Spark device at lunch. HP didn't properly reset the
+device, so I have spent the rest of the day trying to do that. There
+was a user I didn't have the password for.
+
+ I needed a usb-c stick, a HDMI cable, and a wifi point that only
+accepts a password. I have finally managed to get it installing.
+
+
+[09:58]
+
+I have been working on a grammar for the probabilit "language" and I
+am trying to create a consise and easy to understand language for the
+llm. It is a little more difficult than I expected as I need to
+understand what is the core of "probabilistic syntax" and what does
+probabilit need.
+
+* [2026-07-16 Thu]
 
 [16:03]
 
