@@ -1,11 +1,35 @@
 import pytest
 from lark.exceptions import UnexpectedInput
 
-from expr.lang import parser
+from expr.lang import grammar, parser
 
 
 def parse(source):
     return parser.parse(source)
+
+
+def test_grammar_does_not_use_terminal_priorities():
+    assert ".2:" not in grammar
+
+
+def test_grammar_does_not_use_regex_lookaround():
+    assert "(?!" not in grammar
+    assert "(?<" not in grammar
+
+
+def test_program_may_start_with_a_comment():
+    tree = parse(
+        """\
+# Explain the model before its first statement.
+value ~ Normal(0, 1)
+return value
+"""
+    )
+
+    assert [child.data for child in tree.children] == [
+        "random_assign",
+        "return_stmt",
+    ]
 
 
 def test_model_distinguishes_random_and_computed_variables():

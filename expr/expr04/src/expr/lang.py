@@ -57,10 +57,10 @@ return_stmt: "return" expr
 list: "[" _NL* "]"
     | "[" _NL* multiline_expr (_comma multiline_expr)* _comma? _NL* "]"
 
-OPERATOR.2: "+"
+OPERATOR: "+"
         | "*"
-        | /and\\b/
-        | /or\\b/
+        | "and"
+        | "or"
         | "%"
         | "/"
         | "**"
@@ -72,7 +72,7 @@ OPERATOR.2: "+"
         | ">="
         | "!="
         | "//"
-        | /in\\b/
+        | "in"
 
 function: VAR "(" _NL* ")" -> func
         | VAR "(" _NL* _arguments _comma? _NL* ")" -> func
@@ -90,7 +90,7 @@ _keyword_arguments: keyword_argument (_comma keyword_argument)*
 keyword_argument: VAR "=" _NL* multiline_expr
 
 _comma: "," _NL*
-_NOT.2: /not\\b/
+_NOT: "not"
 
 ?correlate: "correlate" VAR "with" VAR "at" SIGNED_NUMBER -> correlate_pair
           | "correlate" variable_list "with" list -> correlate_matrix
