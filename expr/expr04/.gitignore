@@ -1,2 +1,4 @@
 /models/*
 .envrc
+/output.jsonl
+/smollm3_dataset.jsonl
