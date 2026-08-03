@@ -273,3 +273,41 @@ Distribution calls become `probabilit.Distribution` nodes, NumPy calls and
 operators become transform nodes, and correlation statements are attached to
 the returned graph. Conversion reports undefined variables, invalid
 correlations, and unknown NumPy functions as `ModelConversionError`.
+
+## Generate varied exam questions
+
+The exam-question generator samples English nouns and verbs from WordNet and
+asks the LLM to incorporate them into its scenario. Install the English corpus
+once:
+
+```bash
+uv run python -m nltk.downloader wordnet
+```
+
+Generate with the default three nouns and two verbs:
+
+```bash
+uv run python -m expr.llm
+```
+
+Use `--noun-count` and `--verb-count` to change the selection size. Pass
+`--runs` to generate a batch balanced across difficulties and learning
+objectives. Each objective cycles through structural profiles that vary
+distribution families, dependency patterns, and numeric versus boolean result
+expressions while limiting repeated use of normal distributions and
+correlation. Numeric questions can target simulated totals, costs, durations,
+expected values, variability, or quantiles instead of reducing every model to
+a threshold event. During a multi-run batch, accepted model signatures are
+retained in memory and near-duplicate structures are rejected and regenerated.
+Pass `--seed` to reproduce both the profiles and keyword selections:
+
+```bash
+uv run python -m expr.llm --runs 10 --noun-count 4 --verb-count 3 --seed 42
+```
+
+Write the questions to a UTF-8 Markdown file. Multiple questions are separated
+by `---`:
+
+```bash
+uv run python -m expr.llm --runs 10 --output questions.md
+```
