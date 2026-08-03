@@ -1,5 +1,27 @@
 # -*- mode: org -*-
 
+* [2026-08-07 Fri]
+
+[16:11] expr04
+
+
+I have generated about 814 examples of probabilit models and task
+descriptions.
+
+I was trying to get a training run with diffusion gemma, but it the
+recommended fine-tuning config is something like 4 h100s, and we don't
+have that kind of power.
+
+Instead I am looking at SmolLM3 instead. It might be a bit smaller
+than we need. It looks like our 800 examples should only take an hour
+pr epoch. The exciting part is that that means we have a large budget
+for adding symbolics.
+
+Right now I am just training the model to do the inference task. In
+other words, just a normal model and fine-tuning. Hoefully I will now
+on Monday if it was successful or not.
+
+
 * [2026-08-06 Thu]
 [12:36] expr04
 
