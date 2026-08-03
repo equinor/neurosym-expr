@@ -1,5 +1,36 @@
 # -*- mode: org -*-
 
+* [2026-08-06 Thu]
+[12:36] expr04
+
+I have been working on the generation of examples from the grammar.
+The examples should have a scenario to model and a reference solution.
+
+The way I have set it up is that I am asking the llm to generate an
+exam question. The issue I found is that it is difficult to get the
+model to create widely varied examples.
+
+To solve that I use wordnet to generate random nouns and verbs that I
+ask it to use in the example. I also used copilot to find other ways
+of varying the examples with difficulty, learning objective, and
+structural profile.
+
+All errors are propogated to the model and it has 5 tries to get
+output an example.
+
+A side note is that I like this way of working (for this type of task)
+where I set up a skeleton of the problem by hand and then I use
+copilot to look at the output and suggest changes. If I like the
+changes it suggests I get it to implement the changes. If I see a new
+issue in the output I ask copilot to look at the output again and ask
+it to consider the issue and suggest new changes.
+
+The code I am writing is mostly throw-away, but I still need to have a
+good grasp of the underlaying ideas. Working in this way it is easier
+to understand the additions that copilot adds.
+
+
+
 * [2026-08-03 Mon]
 
 [16:17]
