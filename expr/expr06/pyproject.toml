@@ -1,0 +1,25 @@
+[project]
+name = "expr06"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Bjarte Johansen", email = "bjajoh@equinor.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "datasets>=5.0.1",
+    "rich>=15.0.0",
+    "torch>=2.13.0",
+    "transformers>=5.15.1",
+    "trl>=1.10.0",
+    "vllm>=0.27.1 ; sys_platform == 'linux'",
+    "xgrammar>=0.2.3",
+]
+
+[project.scripts]
+expr06 = "expr06:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
