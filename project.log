@@ -1,5 +1,13 @@
 # -*- mode: org -*-
 
+* [2026-08-10 Mon]
+
+[12:36]
+
+There _are_ small diffusion models: https://github.com/ZHZisZZ/dllm
+Should look into this to see if we can use them for our training
+
+
 * [2026-08-07 Fri]
 
 [16:11] expr04
