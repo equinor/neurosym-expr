@@ -1,5 +1,11 @@
 # -*- mode: org -*-
 
+* [2026-08-12 Wed]
+
+This is pretty interesting: https://huggingface.co/Cactus-Compute/needle2
+
+A very small model (45M parameters in 28MB of ram). It can run tools.
+
 * [2026-08-10 Mon]
 
 [12:36]
