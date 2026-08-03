@@ -1,5 +1,51 @@
 # -*- mode: org -*-
 
+[2026-09-01 Tue]
+
+[14:06]
+
+Each token is a step in the latent space. How do we choose the right
+direction? Does it make sense to take more than one step? How about
+the 256 steps of a diffusion model?
+
+Triangular flow to choose? How?
+
+Diffusion models can we trained based on the embeddings and attentions
+of a transformer model: [[https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-diffusiongemma][A visual guide to diffusiongemma]]. What would
+it mean to implement triangular gemma?
+
+
+* [2026-08-25 Tue]
+
+[12:15]
+
+Differentiable grammar -- tie in to differentiable logic
+https://arxiv.org/abs/2303.10650
+
+Can we go from an ebnf to a differentiable grammar that can be used to
+train a neural network?
+
+A definite clause grammar?
+
+Constraint grammar? Visl cg3 ??
+
+[11:55]
+
+Using reinforcement learning to train "reasoning" could be thought of
+as training the model to search for the right solution.
+
+* [2026-08-20 Thu]
+
+[12:02]
+
+Can "Reasoning" in models be thought of as a search in the latent
+space for the correct area to find the solution in? Could it be
+possible to define or affect the search algorithm? Right now it is
+just learned through back-prop. Could we replace it? Instead of a
+general and learned search strategy, could we replace it with a
+defined task-specific strategy?
+
+
 * [2026-08-12 Wed]
 
 This is pretty interesting: https://huggingface.co/Cactus-Compute/needle2
@@ -179,7 +225,6 @@ visual part of the model.
 
 I have been looking at different ways to include logic into the
 training of language models (preferably small).
-
 
 In my work I have observed that when we work with AI and language we
 often end up in a situation where we have good ideas and can find
