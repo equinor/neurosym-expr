@@ -311,3 +311,22 @@ by `---`:
 ```bash
 uv run python -m expr.llm --runs 10 --output questions.md
 ```
+
+Convert completed generations to JSON Lines:
+
+```bash
+uv run python -m expr.output_to_jsonl output.md output.jsonl
+```
+
+Each line contains the nouns, verbs, difficulty, learning objective, structural
+profile, last validated model, task, and reference solution. Reasoning, failed
+model attempts, and incomplete records are omitted.
+
+Convert that file to a SmolLM3 conversational fine-tuning dataset:
+
+```bash
+uv run python -m expr.output_to_smollm3 output.jsonl smollm3_dataset.jsonl
+```
+
+Each output line contains a `messages` array whose user content is the task and
+whose assistant content is only the model.
