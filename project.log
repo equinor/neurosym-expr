@@ -1,5 +1,27 @@
 # -*- mode: org -*-
 
+* [2026-08-03 Mon]
+
+[16:17]
+
+I can now call a model with the grammar. I haven't done it locally
+yet, but I might be able to create reversed training data this way.
+Going to look and see if I can get a good distribution of different
+prob models.
+
+A few notes on the grammar:
+ - Probabilit handles both probabilistic and deterministic variables
+   with the same syntax. The llm does not like this as "normal"
+   probabilistic languages seem to use ~ as probabilistic assignment.
+   This means that probabilistic variables cannot be used in an
+   expression. I don't really see this as a problem and I believe it
+   will just be clearer really.
+ - It was the model that insisted on adding a return statement. I
+   didn't first add it.
+ - I am uncertain if it is good to just use the scipy.stats
+   distributions directly or if we should let it give the variables
+   proper names.
+
 * [2026-07-31 Fri]
 
 [15:48]
