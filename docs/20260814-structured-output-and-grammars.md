@@ -108,11 +108,12 @@ sentiment example above, can contain ambiguity. For example if a user wrote
 
 
 We could reasonably choose any of the 3 labels:
-    - `positive` :: as the user praised the interface,
-    - `negative` :: as the user because they are blocked to complete
-      their task,
-    - `neutral` :: because the statement contains both postive and
-      negative sentiment.
+    
+- `positive` :: as the user praised the interface,
+- `negative` :: as the user because they are blocked to complete
+  their task,
+- `neutral` :: because the statement contains both postive and
+   negative sentiment.
 
 Depending on what we want to achieve with the classification, we could
 (try) to resolve the ambiguity by adding explanations of the labels and
