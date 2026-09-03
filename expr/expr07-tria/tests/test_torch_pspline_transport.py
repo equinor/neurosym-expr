@@ -1,6 +1,9 @@
 import torch
 
-from expr07_tria import AdaptiveSplineTransport
+from expr07_tria import (
+    AdaptiveSplineTransport,
+    BatchedDiagonalSplineTransport,
+)
 from expr07_tria.torch_pspline_transport import _LinearTailBasis
 
 
@@ -219,20 +222,58 @@ def test_float32_fit_uses_precision_appropriate_tolerances() -> None:
 def test_float32_fit_scales_to_production_sample_count() -> None:
     samples = torch.randn(
         64,
-        11_008,
+        12_000,
         generator=torch.Generator().manual_seed(19),
         dtype=torch.float32,
     )
-    transport = AdaptiveSplineTransport(inner_max_iter=100)
-
-    transport.fit(
-        samples,
-        sparsity=torch.eye(11_008, dtype=torch.bool),
-        optimize_lambdas=False,
-    )
+    transport = BatchedDiagonalSplineTransport()
+    transport.fit(samples)
     reconstructed = transport.inverse(transport.forward(samples))
 
     assert torch.allclose(reconstructed, samples, atol=2e-5, rtol=2e-5)
+
+
+def test_batched_transport_requires_at_least_64_samples() -> None:
+    samples = torch.randn(63, 10, dtype=torch.float32)
+
+    try:
+        BatchedDiagonalSplineTransport().fit(samples)
+    except ValueError as error:
+        assert "at least 64 samples" in str(error)
+    else:
+        raise AssertionError("undersized training data should be rejected")
+
+
+def test_batched_transport_restores_standalone_state() -> None:
+    samples = torch.randn(
+        64,
+        8,
+        generator=torch.Generator().manual_seed(29),
+        dtype=torch.float32,
+    )
+    transport = BatchedDiagonalSplineTransport().fit(samples)
+
+    restored = BatchedDiagonalSplineTransport()
+    restored.load_state_dict(transport.state_dict())
+
+    assert torch.equal(restored(samples), transport(samples))
+
+
+def test_batched_transport_preserves_inverse_gradients() -> None:
+    samples = torch.randn(
+        64,
+        4,
+        generator=torch.Generator().manual_seed(31),
+        dtype=torch.float64,
+    )
+    transport = BatchedDiagonalSplineTransport().fit(samples)
+    reference = transport(samples).detach().requires_grad_(True)
+
+    reconstructed = transport.inverse(reference)
+    (gradient,) = torch.autograd.grad(reconstructed.sum(), reference)
+
+    assert torch.all(torch.isfinite(gradient))
+    assert torch.allclose(reconstructed, samples, atol=1e-9, rtol=1e-9)
 
 
 def test_batched_diagonal_state_gradients_and_dtype_semantics() -> None:

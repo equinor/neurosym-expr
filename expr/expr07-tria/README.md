@@ -37,6 +37,17 @@ transport = transport.to(device="cuda", dtype=torch.float32)
 reference = transport(samples.to(device="cuda", dtype=torch.float32))
 ```
 
+For the target workload of at least 64 samples and roughly 12,000 independent
+parameters, use the focused batched implementation. It uses fixed cubic
+P-splines and fits all dimensions together on the input tensor's device:
+
+```python
+from expr07_tria import BatchedDiagonalSplineTransport
+
+samples = torch.randn(64, 12_000, device="cuda")
+transport = BatchedDiagonalSplineTransport().fit(samples)
+```
+
 For conditional sampling, place conditioned variables first and set
 `skip_dimensions` to their count:
 

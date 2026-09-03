@@ -3,11 +3,13 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+Sparsity = Tensor | Sequence[Sequence[int]] | Literal["diagonal"] | None
 
 
 @dataclass(frozen=True)
@@ -1224,17 +1226,24 @@ def _batched_raw_derivatives(
     sample_size: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
     coefficients = _batched_reparameterize(raw_increments)
-    derivative = torch.einsum("ndb,db->nd", derivative_basis, coefficients)
-    reciprocal = derivative.reciprocal()
-    coefficient_gradient = (
-        torch.einsum("dij,dj->di", quadratic, coefficients)
-        - torch.einsum("ndb,nd->db", derivative_basis, reciprocal) / sample_size
+    derivative = torch.sum(
+        derivative_basis * coefficients.unsqueeze(0),
+        dim=2,
     )
-    coefficient_hessian = quadratic + torch.einsum(
-        "ndb,nd,ndc->dbc",
-        derivative_basis,
-        reciprocal.square() / sample_size,
-        derivative_basis,
+    reciprocal = derivative.reciprocal()
+    basis_by_dimension = derivative_basis.permute(1, 0, 2)
+    coefficient_gradient = (
+        torch.bmm(quadratic, coefficients.unsqueeze(2)).squeeze(2)
+        - torch.sum(
+            derivative_basis * reciprocal.unsqueeze(2),
+            dim=0,
+        )
+        / sample_size
+    )
+    coefficient_hessian = quadratic + torch.bmm(
+        basis_by_dimension.transpose(1, 2),
+        basis_by_dimension
+        * (reciprocal.square().T / sample_size).unsqueeze(2),
     )
     sigmoid = torch.sigmoid(raw_increments[:, 1:])
     slopes = torch.cat((torch.ones_like(raw_increments[:, :1]), sigmoid), dim=1)
@@ -1262,9 +1271,16 @@ def _batched_diagonal_objective(
     sample_size: int,
 ) -> Tensor:
     coefficients = _batched_reparameterize(raw_increments)
-    derivative = torch.einsum("ndb,db->nd", derivative_basis, coefficients)
+    derivative = torch.sum(
+        derivative_basis * coefficients.unsqueeze(0),
+        dim=2,
+    )
+    quadratic_coefficients = torch.bmm(
+        quadratic,
+        coefficients.unsqueeze(2),
+    ).squeeze(2)
     return (
-        0.5 * torch.einsum("di,dij,dj->d", coefficients, quadratic, coefficients)
+        0.5 * torch.sum(coefficients * quadratic_coefficients, dim=1)
         - torch.log(derivative).sum(dim=0) / sample_size
     )
 
@@ -1499,7 +1515,7 @@ class AdaptiveSplineTransport(nn.Module):
     def _prepare_sparsity(
         self,
         dimensions: int,
-        sparsity: Tensor | Sequence[Sequence[int]] | None,
+        sparsity: Sparsity,
         *,
         device: torch.device,
     ) -> Tensor:
@@ -1513,6 +1529,10 @@ class AdaptiveSplineTransport(nn.Module):
             matrix = torch.tril(
                 torch.ones(dimensions, dimensions, dtype=torch.bool, device=device)
             )[self.skip_dimensions :]
+        elif sparsity == "diagonal":
+            raise ValueError(
+                'sparsity="diagonal" requires optimize_lambdas=False'
+            )
         else:
             raw = torch.as_tensor(sparsity, device=device)
             if raw.shape != (rows, dimensions):
@@ -1536,10 +1556,12 @@ class AdaptiveSplineTransport(nn.Module):
     def _is_diagonal_sparsity(
         self,
         dimensions: int,
-        sparsity: Tensor | Sequence[Sequence[int]] | None,
+        sparsity: Sparsity,
         *,
         device: torch.device,
     ) -> bool:
+        if sparsity == "diagonal":
+            return True
         if sparsity is None:
             return False
         rows = dimensions - self.skip_dimensions
@@ -1623,7 +1645,11 @@ class AdaptiveSplineTransport(nn.Module):
         nbasis = design.shape[-1]
         penalty = _smoothing_matrix(nbasis, design)
         scales = torch.sqrt(design.square().sum(dim=(0, 2)) / sample_size)
-        gram = torch.einsum("ndb,ndc->dbc", design, design)
+        design_by_dimension = design.permute(1, 0, 2)
+        gram = torch.bmm(
+            design_by_dimension.transpose(1, 2),
+            design_by_dimension,
+        )
         smoothing = (
             torch.exp(initial_logs) * scales.square()
         ).unsqueeze(1).unsqueeze(2) * penalty.unsqueeze(0)
@@ -1686,6 +1712,14 @@ class AdaptiveSplineTransport(nn.Module):
                 direction = torch.where(valid[:, None], candidate, direction)
                 selected = selected | valid
                 damping = torch.where(selected, damping, damping * 10.0)
+                if bool(torch.all(selected)):
+                    break
+            if not bool(torch.all(selected)):
+                failed = torch.count_nonzero(~selected).item()
+                raise RuntimeError(
+                    f"could not find a descent direction for {failed} "
+                    "diagonal components"
+                )
 
             objective = _batched_diagonal_objective(
                 raw_increments,
@@ -1726,6 +1760,13 @@ class AdaptiveSplineTransport(nn.Module):
                 accepted_step = torch.where(accept, step, accepted_step)
                 accepted = accepted | accept
                 step = torch.where(accepted, step, step * 0.5)
+                if bool(torch.all(accepted)):
+                    break
+            if not bool(torch.all(accepted)):
+                failed = torch.count_nonzero(~accepted).item()
+                raise RuntimeError(
+                    f"line search failed for {failed} diagonal components"
+                )
             if (iteration + 1) % 10 == 0:
                 converged = accepted & (
                     torch.linalg.vector_norm(
@@ -1948,7 +1989,7 @@ class AdaptiveSplineTransport(nn.Module):
     def fit(
         self,
         X: Tensor,
-        sparsity: Tensor | Sequence[Sequence[int]] | None = None,
+        sparsity: Sparsity = None,
         *,
         lambda_initial: float | Tensor | Mapping[int, Sequence[float] | Tensor] = 2.0,
         optimize_lambdas: bool = True,
