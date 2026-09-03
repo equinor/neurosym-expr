@@ -401,6 +401,7 @@ class _BatchedDiagonal(nn.Module):
     def __init__(
         self,
         *,
+        degree: int,
         knots: Tensor,
         coefficients: Tensor,
         log_lambdas: Tensor,
@@ -413,8 +414,24 @@ class _BatchedDiagonal(nn.Module):
         right_derivatives: Tensor,
     ) -> None:
         super().__init__()
+        self.degree = degree
         self.register_buffer("knots", knots)
         self.register_buffer("coefficients", coefficients)
+        self.register_buffer(
+            "materialized_coefficients",
+            torch.empty(0, dtype=coefficients.dtype, device=coefficients.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "breakpoints",
+            torch.empty(0, dtype=knots.dtype, device=knots.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "break_values",
+            torch.empty(0, dtype=knots.dtype, device=knots.device),
+            persistent=False,
+        )
         self.register_buffer("log_lambdas", log_lambdas)
         self.register_buffer("effective_dof", effective_dof)
         self.register_buffer("aicc", aicc)
@@ -423,6 +440,131 @@ class _BatchedDiagonal(nn.Module):
         self.register_buffer("right_values", right_values)
         self.register_buffer("left_derivatives", left_derivatives)
         self.register_buffer("right_derivatives", right_derivatives)
+        self._refresh_evaluation_cache()
+
+    def _refresh_evaluation_cache(self) -> None:
+        self.materialized_coefficients = _batched_reparameterize(
+            self.coefficients
+        )
+        self.breakpoints = self.knots[:, self.degree : -self.degree]
+        points = self.breakpoints.T.contiguous()
+        indices, local_values, _ = _batched_local_design(
+            points,
+            self.knots,
+            self.degree,
+            derivative=False,
+        )
+        dimensions = torch.arange(
+            self.knots.shape[0],
+            device=self.knots.device,
+        ).view(1, -1, 1)
+        local_coefficients = self.materialized_coefficients[
+            dimensions,
+            indices,
+        ]
+        self.break_values = torch.sum(
+            local_values * local_coefficients,
+            dim=-1,
+        ).T.contiguous()
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._refresh_evaluation_cache()
+
+
+def _batched_local_design(
+    x: Tensor,
+    knots: Tensor,
+    degree: int,
+    *,
+    derivative: bool,
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    """Evaluate only the degree + 1 nonzero bases for each input."""
+    if x.ndim != 2:
+        raise ValueError("batched spline inputs must have shape (N, D)")
+
+    nbasis = knots.shape[1] - degree - 1
+    left_boundary = knots[:, degree]
+    interval_width = knots[:, degree + 1] - left_boundary
+    spans = degree + torch.floor(
+        (x - left_boundary.unsqueeze(0)) / interval_width.unsqueeze(0)
+    ).to(torch.long)
+    spans = spans.clamp(min=degree, max=nbasis - 1)
+
+    levels = torch.arange(1, degree + 1, device=x.device)
+    dimensions = torch.arange(knots.shape[0], device=x.device).view(1, -1, 1)
+    left_indices = spans.unsqueeze(-1) + 1 - levels
+    right_indices = spans.unsqueeze(-1) + levels
+    left = x.unsqueeze(-1) - knots[dimensions, left_indices]
+    right = knots[dimensions, right_indices] - x.unsqueeze(-1)
+
+    local_basis = torch.ones_like(x).unsqueeze(-1)
+    lower_basis = local_basis if derivative else None
+    for level in range(1, degree + 1):
+        saved = torch.zeros_like(x)
+        next_basis = []
+        for index in range(level):
+            denominator = right[..., index] + left[..., level - index - 1]
+            ratio = torch.where(
+                denominator != 0,
+                local_basis[..., index] / denominator,
+                torch.zeros_like(denominator),
+            )
+            next_basis.append(saved + right[..., index] * ratio)
+            saved = left[..., level - index - 1] * ratio
+        next_basis.append(saved)
+        local_basis = torch.stack(next_basis, dim=-1)
+        if derivative and level == degree - 1:
+            lower_basis = local_basis
+
+    offsets = torch.arange(-degree, 1, device=x.device)
+    knot_indices = spans.unsqueeze(-1) + offsets
+    if not derivative:
+        return knot_indices, local_basis, None
+
+    assert lower_basis is not None
+    alpha_denominator = (
+        knots[dimensions, knot_indices + degree]
+        - knots[dimensions, knot_indices]
+    )
+    beta_denominator = (
+        knots[dimensions, knot_indices + degree + 1]
+        - knots[dimensions, knot_indices + 1]
+    )
+    alpha = torch.where(
+        alpha_denominator != 0,
+        degree / alpha_denominator,
+        torch.zeros_like(alpha_denominator),
+    )
+    beta = torch.where(
+        beta_denominator != 0,
+        degree / beta_denominator,
+        torch.zeros_like(beta_denominator),
+    )
+    lower_left = F.pad(lower_basis, (1, 0))
+    lower_right = F.pad(lower_basis, (0, 1))
+    return (
+        knot_indices,
+        local_basis,
+        alpha * lower_left - beta * lower_right,
+    )
 
 
 def _batched_bounded_design_and_derivative(
@@ -430,91 +572,57 @@ def _batched_bounded_design_and_derivative(
     knots: Tensor,
     degree: int,
 ) -> tuple[Tensor, Tensor]:
-    """Evaluate all diagonal B-spline bases without materializing modules."""
-    if x.ndim != 2:
-        raise ValueError("batched spline inputs must have shape (N, D)")
-    knot_count = knots.shape[1]
-    nbasis = knot_count - degree - 1
-    values = (
-        (x.unsqueeze(-1) >= knots[:, :-1].unsqueeze(0))
-        & (x.unsqueeze(-1) < knots[:, 1:].unsqueeze(0))
-    ).to(dtype=x.dtype)
-    at_right = x >= knots[:, nbasis].unsqueeze(0)
-    values[..., -1] = torch.where(
-        at_right,
-        torch.ones_like(x),
-        values[..., -1],
+    """Materialize dense bases only for fitting."""
+    indices, local_values, local_derivatives = _batched_local_design(
+        x,
+        knots,
+        degree,
+        derivative=True,
     )
-    lower_values: Tensor | None = None
-    for level in range(1, degree + 1):
-        size = knot_count - level - 1
-        left_denominator = (
-            knots[:, level : level + size] - knots[:, :size]
-        ).unsqueeze(0)
-        right_denominator = (
-            knots[:, level + 1 : level + 1 + size]
-            - knots[:, 1 : 1 + size]
-        ).unsqueeze(0)
-        left = torch.where(
-            left_denominator != 0,
-            (x.unsqueeze(-1) - knots[:, :size].unsqueeze(0))
-            / torch.where(
-                left_denominator != 0,
-                left_denominator,
-                torch.ones_like(left_denominator),
-            )
-            * values[..., :size],
-            torch.zeros_like(values[..., :size]),
-        )
-        right = torch.where(
-            right_denominator != 0,
-            (knots[:, level + 1 : level + 1 + size].unsqueeze(0)
-            - x.unsqueeze(-1))
-            / torch.where(
-                right_denominator != 0,
-                right_denominator,
-                torch.ones_like(right_denominator),
-            )
-            * values[..., 1 : size + 1],
-            torch.zeros_like(values[..., :size]),
-        )
-        values = left + right
-        if level == degree - 1:
-            lower_values = values
-
-    assert lower_values is not None
-    left_denominator = knots[:, degree : degree + nbasis] - knots[:, :nbasis]
-    right_denominator = (
-        knots[:, degree + 1 : degree + 1 + nbasis]
-        - knots[:, 1 : 1 + nbasis]
-    )
-    left_scale = torch.where(
-        left_denominator != 0,
-        degree / left_denominator,
-        torch.zeros_like(left_denominator),
-    )
-    right_scale = torch.where(
-        right_denominator != 0,
-        degree / right_denominator,
-        torch.zeros_like(right_denominator),
-    )
-    derivatives = (
-        left_scale.unsqueeze(0) * lower_values[..., :nbasis]
-        - right_scale.unsqueeze(0) * lower_values[..., 1 : nbasis + 1]
-    )
-    right_values = torch.zeros_like(values)
-    right_values[..., -1] = 1.0
-    right_derivatives = torch.zeros_like(derivatives)
-    final_slope = degree / (knots[:, nbasis] - knots[:, nbasis - 1])
-    right_derivatives[..., -2] = -final_slope.unsqueeze(0)
-    right_derivatives[..., -1] = final_slope.unsqueeze(0)
-    values = torch.where(at_right.unsqueeze(-1), right_values, values)
-    derivatives = torch.where(
-        at_right.unsqueeze(-1),
-        right_derivatives,
-        derivatives,
-    )
+    assert local_derivatives is not None
+    nbasis = knots.shape[1] - degree - 1
+    values = x.new_zeros((*x.shape, nbasis))
+    derivatives = torch.zeros_like(values)
+    values.scatter_(2, indices, local_values)
+    derivatives.scatter_(2, indices, local_derivatives)
     return values, derivatives
+
+
+def _batched_diagonal_values(
+    x: Tensor,
+    diagonal: _BatchedDiagonal,
+    degree: int,
+) -> Tensor:
+    left = diagonal.knots[:, degree]
+    right = diagonal.knots[:, -degree - 1]
+    bounded = torch.maximum(
+        torch.minimum(x, right.unsqueeze(0)),
+        left.unsqueeze(0),
+    )
+    indices, local_values, _ = _batched_local_design(
+        bounded,
+        diagonal.knots,
+        degree,
+        derivative=False,
+    )
+    dimensions = torch.arange(x.shape[1], device=x.device).view(1, -1, 1)
+    local_coefficients = diagonal.materialized_coefficients[
+        dimensions,
+        indices,
+    ]
+    values = torch.sum(local_values * local_coefficients, dim=-1)
+    values = torch.where(
+        x < left.unsqueeze(0),
+        diagonal.left_values.unsqueeze(0)
+        + (x - left.unsqueeze(0)) * diagonal.left_derivatives.unsqueeze(0),
+        values,
+    )
+    return torch.where(
+        x > right.unsqueeze(0),
+        diagonal.right_values.unsqueeze(0)
+        + (x - right.unsqueeze(0)) * diagonal.right_derivatives.unsqueeze(0),
+        values,
+    )
 
 
 def _batched_diagonal_evaluate(
@@ -528,17 +636,20 @@ def _batched_diagonal_evaluate(
         torch.minimum(x, right.unsqueeze(0)),
         left.unsqueeze(0),
     )
-    design, derivative_design = _batched_bounded_design_and_derivative(
+    indices, local_values, local_derivatives = _batched_local_design(
         bounded,
         diagonal.knots,
         degree,
+        derivative=True,
     )
-    coefficients = _batched_reparameterize(diagonal.coefficients)
-    values = torch.sum(design * coefficients.unsqueeze(0), dim=-1)
-    derivatives = torch.sum(
-        derivative_design * coefficients.unsqueeze(0),
-        dim=-1,
-    )
+    assert local_derivatives is not None
+    dimensions = torch.arange(x.shape[1], device=x.device).view(1, -1, 1)
+    local_coefficients = diagonal.materialized_coefficients[
+        dimensions,
+        indices,
+    ]
+    values = torch.sum(local_values * local_coefficients, dim=-1)
+    derivatives = torch.sum(local_derivatives * local_coefficients, dim=-1)
     below = x < left.unsqueeze(0)
     above = x > right.unsqueeze(0)
     values = torch.where(
@@ -1221,7 +1332,6 @@ def _batched_raw_derivatives(
     raw_increments: Tensor,
     quadratic: Tensor,
     derivative_basis: Tensor,
-    cumulative: Tensor,
     *,
     sample_size: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -1248,11 +1358,26 @@ def _batched_raw_derivatives(
         torch.cumsum(torch.flip(coefficient_gradient, dims=(1,)), dim=1),
         dims=(1,),
     )
-    jacobian = cumulative.unsqueeze(0) * slopes.unsqueeze(1)
-    hessian = torch.matmul(
-        torch.matmul(jacobian.transpose(1, 2), coefficient_hessian),
-        jacobian,
-    ) + torch.diag_embed(curvatures * reverse_gradient)
+    transformed_hessian = torch.flip(
+        torch.cumsum(
+            torch.flip(coefficient_hessian, dims=(1,)),
+            dim=1,
+        ),
+        dims=(1,),
+    )
+    transformed_hessian = torch.flip(
+        torch.cumsum(
+            torch.flip(transformed_hessian, dims=(2,)),
+            dim=2,
+        ),
+        dims=(2,),
+    )
+    hessian = (
+        transformed_hessian
+        * slopes.unsqueeze(2)
+        * slopes.unsqueeze(1)
+        + torch.diag_embed(curvatures * reverse_gradient)
+    )
     return coefficients, slopes * reverse_gradient, hessian
 
 
@@ -1387,6 +1512,7 @@ class AdaptiveSplineTransport(nn.Module):
             if diagonal:
                 diagonal_prefix = f"{prefix}diagonal."
                 self.diagonal = _BatchedDiagonal(
+                    degree=self.degree,
                     knots=torch.empty_like(state_dict[f"{diagonal_prefix}knots"]),
                     coefficients=torch.empty_like(
                         state_dict[f"{diagonal_prefix}coefficients"]
@@ -1630,7 +1756,6 @@ class AdaptiveSplineTransport(nn.Module):
             torch.exp(initial_logs) * scales.square()
         ).unsqueeze(1).unsqueeze(2) * penalty.unsqueeze(0)
         quadratic = (gram + smoothing) / sample_size
-        cumulative = torch.tril(design.new_ones((nbasis, nbasis)))
         identity = torch.eye(nbasis, dtype=self.dtype, device=self.device)
 
         if beta_initial is None:
@@ -1664,7 +1789,6 @@ class AdaptiveSplineTransport(nn.Module):
                 raw_increments,
                 quadratic,
                 derivative_basis,
-                cumulative,
                 sample_size=sample_size,
             )
             gradient_norm = torch.linalg.vector_norm(
@@ -1770,14 +1894,12 @@ class AdaptiveSplineTransport(nn.Module):
             raw_increments,
             unpenalized_quadratic,
             derivative_basis,
-            cumulative,
             sample_size=1,
         )
         _, _, penalized_hessian = _batched_raw_derivatives(
             raw_increments,
             gram + smoothing,
             derivative_basis,
-            cumulative,
             sample_size=1,
         )
         ridge = 1e-8 * torch.maximum(
@@ -1814,6 +1936,7 @@ class AdaptiveSplineTransport(nn.Module):
             self.degree,
         )
         self.diagonal = _BatchedDiagonal(
+            degree=self.degree,
             knots=knots,
             coefficients=raw_increments.detach(),
             log_lambdas=initial_logs.detach(),
@@ -2145,11 +2268,11 @@ class AdaptiveSplineTransport(nn.Module):
 
     def _forward_diagonal(self, standardized: Tensor) -> Tensor:
         assert self.diagonal is not None
-        return _batched_diagonal_evaluate(
+        return _batched_diagonal_values(
             standardized[:, self.skip_dimensions :],
             self.diagonal,
             self.degree,
-        )[0]
+        )
 
     def forward(self, X: Tensor) -> Tensor:
         standardized = self._standardize(X)
@@ -2237,17 +2360,30 @@ class AdaptiveSplineTransport(nn.Module):
         epsilon = 100.0 * torch.finfo(reference.dtype).eps
         below = reference < diagonal.left_values.unsqueeze(0)
         above = reference > diagonal.right_values.unsqueeze(0)
-        low = left.unsqueeze(0).expand_as(reference)
-        high = right.unsqueeze(0).expand_as(reference)
-        middle = left.unsqueeze(0) + (right - left).unsqueeze(0) * (
-            (reference - diagonal.left_values.unsqueeze(0))
-            / (diagonal.right_values - diagonal.left_values).unsqueeze(0)
+        interval = torch.sum(
+            reference.unsqueeze(-1) >= diagonal.break_values.unsqueeze(0),
+            dim=-1,
+        ) - 1
+        interval = interval.clamp(
+            min=0,
+            max=diagonal.breakpoints.shape[1] - 2,
         )
-        middle = torch.maximum(
-            torch.minimum(middle, right.unsqueeze(0)),
-            left.unsqueeze(0),
+        dimensions = torch.arange(
+            reference.shape[1],
+            device=reference.device,
+        ).unsqueeze(0)
+        low = diagonal.breakpoints[dimensions, interval]
+        high = diagonal.breakpoints[dimensions, interval + 1]
+        low_value = diagonal.break_values[dimensions, interval]
+        high_value = diagonal.break_values[dimensions, interval + 1]
+        value_width = high_value - low_value
+        fraction = torch.where(
+            value_width > epsilon,
+            (reference - low_value) / value_width,
+            torch.full_like(reference, 0.5),
         )
-        required_iterations = 24 if reference.dtype == torch.float32 else 40
+        middle = low + fraction.clamp(min=0.0, max=1.0) * (high - low)
+        required_iterations = 12 if reference.dtype == torch.float32 else 24
         for _ in range(min(self.inverse_iterations, required_iterations)):
             values, slopes = _batched_diagonal_evaluate(
                 middle,
