@@ -6,9 +6,9 @@ Triangular Measure Transport*.
 
 The implementation uses:
 
-- `torchcurves` for differentiable B-spline evaluation;
+- local Cox-de Boor evaluation for differentiable B-spline bases;
 - a PyTorch damped-Newton inner solver;
-- TorchOpt implicit differentiation for the fitted spline coefficients;
+- direct implicit differentiation using the fitted spline Hessian;
 - `torch.optim.LBFGS` for AICc-based smoothing selection;
 - PyTorch linear algebra and bisection for forward and inverse maps.
 

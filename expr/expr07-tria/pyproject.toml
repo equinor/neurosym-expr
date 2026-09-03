@@ -9,8 +9,6 @@ authors = [
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch>=2.7",
-    "torchcurves>=0.2.1",
-    "torchopt>=0.7.3",
 ]
 
 [dependency-groups]

@@ -1,6 +1,7 @@
 import torch
 
 from expr07_tria import AdaptiveSplineTransport
+from expr07_tria.torch_pspline_transport import _LinearTailBasis
 
 
 def correlated_samples(count: int = 36) -> torch.Tensor:
@@ -17,6 +18,73 @@ def correlated_samples(count: int = 36) -> torch.Tensor:
         dtype=torch.float64,
     )
     return torch.stack((x0, x1, x2), dim=1)
+
+
+def test_analytical_basis_derivative_matches_finite_difference() -> None:
+    points = torch.tensor(
+        [-1.5, -0.83, -0.37, 0.11, 0.62, 0.91, 1.5],
+        dtype=torch.float64,
+    )
+    step = 1e-6
+
+    for degree in (1, 2, 3):
+        real_knots = torch.linspace(-1.0, 1.0, 6, dtype=torch.float64)
+        knots = torch.cat(
+            (
+                real_knots[:1].repeat(degree),
+                real_knots,
+                real_knots[-1:].repeat(degree),
+            )
+        )
+        basis = _LinearTailBasis(degree, knots)
+        derivative = basis.derivative_design(points)
+        finite_difference = (
+            basis.design(points + step) - basis.design(points - step)
+        ) / (2.0 * step)
+
+        assert torch.allclose(
+            derivative,
+            finite_difference,
+            atol=2e-8,
+            rtol=2e-7,
+        )
+
+
+def test_local_spline_evaluation_matches_dense_design() -> None:
+    points = torch.linspace(-1.5, 1.5, 31, dtype=torch.float64)
+    generator = torch.Generator().manual_seed(11)
+
+    for degree in (1, 2, 3):
+        real_knots = torch.linspace(-1.0, 1.0, 6, dtype=torch.float64)
+        knots = torch.cat(
+            (
+                real_knots[:1].repeat(degree),
+                real_knots,
+                real_knots[-1:].repeat(degree),
+            )
+        )
+        basis = _LinearTailBasis(degree, knots)
+        coefficients = torch.randn(
+            basis.nbasis,
+            generator=generator,
+            dtype=torch.float64,
+        )
+
+        values, derivatives = basis.evaluate_and_derivative(
+            points,
+            coefficients,
+        )
+        cached_values = basis.evaluate_local(
+            basis.local_design(points),
+            coefficients,
+        )
+
+        assert torch.allclose(values, basis.design(points) @ coefficients)
+        assert torch.allclose(cached_values, values)
+        assert torch.allclose(
+            derivatives,
+            basis.derivative_design(points) @ coefficients,
+        )
 
 
 def test_forward_inverse_round_trip() -> None:
@@ -148,6 +216,60 @@ def test_float32_fit_uses_precision_appropriate_tolerances() -> None:
     assert torch.allclose(reconstructed, samples, atol=2e-5, rtol=2e-5)
 
 
+def test_float32_fit_scales_to_production_sample_count() -> None:
+    samples = torch.randn(
+        64,
+        11_008,
+        generator=torch.Generator().manual_seed(19),
+        dtype=torch.float32,
+    )
+    transport = AdaptiveSplineTransport(inner_max_iter=100)
+
+    transport.fit(
+        samples,
+        sparsity=torch.eye(11_008, dtype=torch.bool),
+        optimize_lambdas=False,
+    )
+    reconstructed = transport.inverse(transport.forward(samples))
+
+    assert torch.allclose(reconstructed, samples, atol=2e-5, rtol=2e-5)
+
+
+def test_batched_diagonal_state_gradients_and_dtype_semantics() -> None:
+    samples = torch.randn(
+        32,
+        4,
+        generator=torch.Generator().manual_seed(23),
+        dtype=torch.float64,
+    )
+    transport = AdaptiveSplineTransport(k=3, inner_max_iter=60)
+    transport.fit(
+        samples,
+        sparsity=torch.eye(4, dtype=torch.bool),
+        optimize_lambdas=False,
+    )
+    assert transport.diagonal is not None
+    assert transport.sparsity_ is None
+    assert "diagonal.coefficients" in transport.state_dict()
+    assert not any(key.startswith("bases.") for key in transport.state_dict())
+
+    reference = transport(samples).detach().requires_grad_(True)
+    reconstructed = transport.inverse(reference)
+    (gradient,) = torch.autograd.grad(reconstructed.sum(), reference)
+    assert torch.all(torch.isfinite(gradient))
+    assert torch.allclose(reconstructed, samples, atol=1e-9, rtol=1e-9)
+
+    restored = AdaptiveSplineTransport(k=3)
+    restored.load_state_dict(transport.state_dict())
+    assert restored.diagonal is not None
+    assert torch.equal(restored(samples), transport(samples))
+
+    transport = transport.to(dtype=torch.float32)
+    result = transport(samples.to(torch.float32))
+    assert result.dtype == torch.float32
+    assert transport.coefficients_[0].dtype == torch.float32
+
+
 def test_invalid_nontriangular_sparsity_is_rejected() -> None:
     samples = correlated_samples()[:, :2]
     transport = AdaptiveSplineTransport(k=2)
@@ -192,6 +314,21 @@ def test_state_dict_restores_a_fitted_transport() -> None:
 
     assert torch.equal(restored(samples), expected)
     assert torch.equal(restored.aicc_, transport.aicc_)
+
+
+def test_state_dict_restores_legacy_torchcurves_basis_state() -> None:
+    samples = correlated_samples()[:, :2]
+    transport = AdaptiveSplineTransport(k=3, inner_max_iter=60)
+    transport.fit(samples, optimize_lambdas=False)
+    state = transport.state_dict()
+    for dimension in range(samples.shape[1]):
+        knots = state[f"bases.{dimension}.knots"]
+        state[f"bases.{dimension}.basis.knots"] = knots.clone()
+
+    restored = AdaptiveSplineTransport(k=3)
+    restored.load_state_dict(state)
+
+    assert torch.equal(restored(samples), transport(samples))
 
 
 def test_state_dict_restores_transport_nested_in_module() -> None:
