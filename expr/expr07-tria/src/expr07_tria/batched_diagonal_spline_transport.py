@@ -186,15 +186,18 @@ def _bounded_evaluate(
     )
 
 
-def _coefficients(raw_increments: Tensor) -> Tensor:
-    positive_increments = torch.cat(
+def _positive_increments(raw_increments: Tensor) -> Tensor:
+    return torch.cat(
         (
             raw_increments[:, :1],
             F.softplus(raw_increments[:, 1:]),
         ),
         dim=1,
     )
-    return torch.cumsum(positive_increments, dim=1)
+
+
+def _coefficients(raw_increments: Tensor) -> Tensor:
+    return torch.cumsum(_positive_increments(raw_increments), dim=1)
 
 
 def _smoothing_matrix(size: int, reference: Tensor) -> Tensor:
@@ -207,29 +210,27 @@ def _objective_derivatives(
     raw_increments: Tensor,
     quadratic: Tensor,
     derivative_basis: Tensor,
-    cumulative: Tensor,
     sample_count: int,
 ) -> tuple[Tensor, Tensor]:
-    coefficients = _coefficients(raw_increments)
-    derivative = torch.sum(
-        derivative_basis * coefficients.unsqueeze(0),
-        dim=2,
-    )
+    increments = _positive_increments(raw_increments)
+    derivative = torch.bmm(
+        derivative_basis,
+        increments.unsqueeze(2),
+    ).squeeze(2)
     reciprocal = derivative.reciprocal()
-    coefficient_gradient = (
-        torch.bmm(quadratic, coefficients.unsqueeze(2)).squeeze(2)
-        - torch.sum(
-            derivative_basis * reciprocal.unsqueeze(2),
-            dim=0,
-        )
+    increment_gradient = (
+        torch.bmm(quadratic, increments.unsqueeze(2)).squeeze(2)
+        - torch.bmm(
+            derivative_basis.transpose(1, 2),
+            reciprocal.unsqueeze(2),
+        ).squeeze(2)
         / sample_count
     )
 
-    basis_by_dimension = derivative_basis.permute(1, 0, 2)
-    coefficient_hessian = quadratic + torch.bmm(
-        basis_by_dimension.transpose(1, 2),
-        basis_by_dimension
-        * (reciprocal.square().T / sample_count).unsqueeze(2),
+    increment_hessian = quadratic + torch.bmm(
+        derivative_basis.transpose(1, 2),
+        derivative_basis
+        * (reciprocal.square() / sample_count).unsqueeze(2),
     )
 
     sigmoid = torch.sigmoid(raw_increments[:, 1:])
@@ -244,16 +245,11 @@ def _objective_derivatives(
         ),
         dim=1,
     )
-    reverse_gradient = torch.flip(
-        torch.cumsum(torch.flip(coefficient_gradient, dims=(1,)), dim=1),
-        dims=(1,),
+    hessian = (
+        increment_hessian * slopes.unsqueeze(1) * slopes.unsqueeze(2)
+        + torch.diag_embed(curvatures * increment_gradient)
     )
-    jacobian = cumulative.unsqueeze(0) * slopes.unsqueeze(1)
-    hessian = torch.matmul(
-        torch.matmul(jacobian.transpose(1, 2), coefficient_hessian),
-        jacobian,
-    ) + torch.diag_embed(curvatures * reverse_gradient)
-    return slopes * reverse_gradient, hessian
+    return slopes * increment_gradient, hessian
 
 
 def _objective(
@@ -262,18 +258,18 @@ def _objective(
     derivative_basis: Tensor,
     sample_count: int,
 ) -> Tensor:
-    coefficients = _coefficients(raw_increments)
-    derivative = torch.sum(
-        derivative_basis * coefficients.unsqueeze(0),
-        dim=2,
-    )
-    quadratic_coefficients = torch.bmm(
+    increments = _positive_increments(raw_increments)
+    derivative = torch.bmm(
+        derivative_basis,
+        increments.unsqueeze(2),
+    ).squeeze(2)
+    quadratic_increments = torch.bmm(
         quadratic,
-        coefficients.unsqueeze(2),
+        increments.unsqueeze(2),
     ).squeeze(2)
     return (
-        0.5 * torch.sum(coefficients * quadratic_coefficients, dim=1)
-        - torch.log(derivative).sum(dim=0) / sample_count
+        0.5 * torch.sum(increments * quadratic_increments, dim=1)
+        - torch.log(derivative).sum(dim=1) / sample_count
     )
 
 
@@ -434,20 +430,32 @@ class BatchedDiagonalSplineTransport(nn.Module):
         )
         design, derivative_basis = _bounded_basis(bounded, knots)
         basis_count = design.shape[2]
-        design_by_dimension = design.permute(1, 0, 2)
+        design_by_dimension = design.permute(1, 0, 2).contiguous()
+        derivative_by_dimension = derivative_basis.permute(1, 0, 2).contiguous()
+        del standardized, bounded
         gram = torch.bmm(
             design_by_dimension.transpose(1, 2),
             design_by_dimension,
         )
         penalty = _smoothing_matrix(basis_count, design)
-        scales = torch.sqrt(design.square().sum(dim=(0, 2)) / sample_count)
+        del design
+        scales = torch.sqrt(
+            design_by_dimension.square().sum(dim=(1, 2)) / sample_count
+        )
         smoothing = (
             math.exp(2.0) * scales.square()
         ).unsqueeze(1).unsqueeze(2) * penalty.unsqueeze(0)
-        quadratic = (gram + smoothing) / sample_count
-        cumulative = torch.tril(
-            design.new_ones((basis_count, basis_count))
+        cumulative_derivative_basis = (
+            derivative_by_dimension.flip(2).cumsum(2).flip(2)
         )
+        del derivative_basis
+        transformed_gram = gram.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+        transformed_smoothing = (
+            smoothing.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+        )
+        quadratic = (
+            transformed_gram + transformed_smoothing
+        ) / sample_count
         identity = torch.eye(
             basis_count,
             dtype=samples.dtype,
@@ -468,8 +476,7 @@ class BatchedDiagonalSplineTransport(nn.Module):
             gradient, hessian = _objective_derivatives(
                 raw_increments,
                 quadratic,
-                derivative_basis,
-                cumulative,
+                cumulative_derivative_basis,
                 sample_count,
             )
             curvature = torch.maximum(
@@ -504,7 +511,7 @@ class BatchedDiagonalSplineTransport(nn.Module):
             objective = _objective(
                 raw_increments,
                 quadratic,
-                derivative_basis,
+                cumulative_derivative_basis,
                 sample_count,
             )
             objective_tolerance = (
@@ -521,7 +528,7 @@ class BatchedDiagonalSplineTransport(nn.Module):
                 candidate_objective = _objective(
                     candidate,
                     quadratic,
-                    derivative_basis,
+                    cumulative_derivative_basis,
                     sample_count,
                 )
                 accept = (
@@ -559,16 +566,14 @@ class BatchedDiagonalSplineTransport(nn.Module):
         coefficients = _coefficients(raw_increments).detach()
         _, unpenalized_hessian = _objective_derivatives(
             raw_increments,
-            gram,
-            derivative_basis,
-            cumulative,
+            transformed_gram,
+            cumulative_derivative_basis,
             1,
         )
         _, penalized_hessian = _objective_derivatives(
             raw_increments,
-            gram + smoothing,
-            derivative_basis,
-            cumulative,
+            transformed_gram + transformed_smoothing,
+            cumulative_derivative_basis,
             1,
         )
         ridge = 1e-8 * torch.maximum(
@@ -587,14 +592,17 @@ class BatchedDiagonalSplineTransport(nn.Module):
             dim1=1,
             dim2=2,
         ).sum(dim=1)
-        mapped = torch.sum(design * coefficients.unsqueeze(0), dim=2)
-        derivatives = torch.sum(
-            derivative_basis * coefficients.unsqueeze(0),
-            dim=2,
-        )
+        mapped = torch.bmm(
+            design_by_dimension,
+            coefficients.unsqueeze(2),
+        ).squeeze(2)
+        derivatives = torch.bmm(
+            derivative_by_dimension,
+            coefficients.unsqueeze(2),
+        ).squeeze(2)
         nll = (
-            0.5 * mapped.square().sum(dim=0)
-            - torch.log(derivatives).sum(dim=0)
+            0.5 * mapped.square().sum(dim=1)
+            - torch.log(derivatives).sum(dim=1)
         )
         correction = effective_dof * (effective_dof + 1.0) / torch.clamp(
             sample_count - effective_dof - 1.0,
@@ -730,7 +738,11 @@ class BatchedDiagonalSplineTransport(nn.Module):
         coefficients = _coefficients(self.raw_coefficients_)
         iterations = 24 if Z.dtype == torch.float32 else 40
         for _ in range(min(_INVERSE_ITERATIONS, iterations)):
-            values, slopes = self._evaluate(middle, coefficients)
+            values, slopes = _bounded_evaluate(
+                middle,
+                self.knots_,
+                coefficients,
+            )
             low = torch.where(values < Z, middle, low)
             high = torch.where(values >= Z, middle, high)
             root_tolerance = (
