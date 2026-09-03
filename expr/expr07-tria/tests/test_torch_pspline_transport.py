@@ -244,6 +244,15 @@ def test_batched_transport_requires_at_least_64_samples() -> None:
         raise AssertionError("undersized training data should be rejected")
 
 
+def test_batched_transport_validates_fit_iterations() -> None:
+    try:
+        BatchedDiagonalSplineTransport(max_fit_iterations=0)
+    except ValueError as error:
+        assert "max_fit_iterations must be at least 1" in str(error)
+    else:
+        raise AssertionError("non-positive fit iterations should be rejected")
+
+
 def test_batched_transport_restores_standalone_state() -> None:
     samples = torch.randn(
         64,
@@ -257,6 +266,24 @@ def test_batched_transport_restores_standalone_state() -> None:
     restored.load_state_dict(transport.state_dict())
 
     assert torch.equal(restored(samples), transport(samples))
+
+
+def test_batched_transport_rebuilds_cached_polynomials_from_older_state() -> None:
+    samples = torch.randn(
+        64,
+        8,
+        generator=torch.Generator().manual_seed(37),
+        dtype=torch.float32,
+    )
+    transport = BatchedDiagonalSplineTransport().fit(samples)
+    state = transport.state_dict()
+    del state["polynomial_coefficients_"]
+    del state["interval_offsets_"]
+
+    restored = BatchedDiagonalSplineTransport()
+    restored.load_state_dict(state)
+
+    assert torch.allclose(restored(samples), transport(samples))
 
 
 def test_batched_transport_preserves_inverse_gradients() -> None:

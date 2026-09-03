@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -9,8 +10,23 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 _DEGREE = 3
-_INNER_MAX_ITERATIONS = 100
+_DEFAULT_FIT_ITERATIONS = 10
 _INVERSE_ITERATIONS = 60
+_FIT_DIMENSION_BATCH_SIZE = 16_384
+
+
+@dataclass
+class _FitBatch:
+    knots: Tensor
+    raw_coefficients: Tensor
+    polynomial_coefficients: Tensor
+    effective_dof: Tensor
+    aicc: Tensor
+    nll: Tensor
+    left_values: Tensor
+    right_values: Tensor
+    left_derivatives: Tensor
+    right_derivatives: Tensor
 
 
 def _bounded_basis(x: Tensor, knots: Tensor) -> tuple[Tensor, Tensor]:
@@ -107,11 +123,13 @@ def _bounded_basis(x: Tensor, knots: Tensor) -> tuple[Tensor, Tensor]:
     return values, derivatives
 
 
-def _bounded_evaluate(
+def _bounded_basis_evaluate(
     x: Tensor,
     knots: Tensor,
     coefficients: Tensor,
-) -> tuple[Tensor, Tensor]:
+    *,
+    with_derivatives: bool = True,
+) -> tuple[Tensor, Tensor | None]:
     """Evaluate only the four non-zero cubic basis functions."""
     basis_count = knots.shape[1] - _DEGREE - 1
     left = knots[:, _DEGREE]
@@ -157,6 +175,11 @@ def _bounded_evaluate(
     assert lower_basis is not None
     offsets = torch.arange(-_DEGREE, 1, device=x.device)
     knot_indices = spans.unsqueeze(2) + offsets
+    local_coefficients = coefficients[dimensions, knot_indices]
+    values = torch.sum(local_basis * local_coefficients, dim=2)
+    if not with_derivatives:
+        return values, None
+
     alpha_denominator = (
         knots[dimensions, knot_indices + _DEGREE]
         - knots[dimensions, knot_indices]
@@ -179,11 +202,81 @@ def _bounded_evaluate(
         alpha * F.pad(lower_basis, (1, 0))
         - beta * F.pad(lower_basis, (0, 1))
     )
-    local_coefficients = coefficients[dimensions, knot_indices]
-    return (
-        torch.sum(local_basis * local_coefficients, dim=2),
-        torch.sum(local_derivatives * local_coefficients, dim=2),
+    derivatives = torch.sum(local_derivatives * local_coefficients, dim=2)
+    return values, derivatives
+
+
+def _polynomial_coefficients(knots: Tensor, coefficients: Tensor) -> Tensor:
+    """Convert each uniform spline interval to a cubic in local coordinates."""
+    basis_count = knots.shape[1] - _DEGREE - 1
+    interval_count = basis_count - _DEGREE
+    edges = knots[:, _DEGREE : basis_count + 1]
+    nodes = knots.new_tensor((0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0))
+    points = (
+        edges[:, :-1].unsqueeze(0)
+        + nodes[:, None, None]
+        * (edges[:, 1:] - edges[:, :-1]).unsqueeze(0)
     )
+    values, _ = _bounded_basis_evaluate(
+        points.permute(2, 0, 1).reshape(-1, knots.shape[0]),
+        knots,
+        coefficients,
+        with_derivatives=False,
+    )
+    values = values.reshape(interval_count, nodes.numel(), -1).permute(2, 0, 1)
+    value_to_power = knots.new_tensor(
+        (
+            (1.0, 0.0, 0.0, 0.0),
+            (-5.5, 9.0, -4.5, 1.0),
+            (9.0, -22.5, 18.0, -4.5),
+            (-4.5, 13.5, -13.5, 4.5),
+        )
+    )
+    return values @ value_to_power.T
+
+
+def _polynomial_evaluate(
+    x: Tensor,
+    knots: Tensor,
+    polynomial_coefficients: Tensor,
+    interval_offsets: Tensor,
+    *,
+    with_derivatives: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    """Evaluate cached interval polynomials without constructing spline bases."""
+    interval_count = polynomial_coefficients.shape[1]
+    left = knots[:, _DEGREE]
+    right = knots[:, -_DEGREE - 1]
+    scaled = (x - left) / (right - left) * interval_count
+    intervals = torch.floor(scaled).to(torch.long).clamp(
+        min=0,
+        max=interval_count - 1,
+    )
+    local_x = scaled - intervals
+    local_coefficients = F.embedding(
+        intervals + interval_offsets,
+        polynomial_coefficients.flatten(0, 1),
+    )
+    values = (
+        (
+            local_coefficients[..., 3] * local_x
+            + local_coefficients[..., 2]
+        )
+        * local_x
+        + local_coefficients[..., 1]
+    ) * local_x + local_coefficients[..., 0]
+    if not with_derivatives:
+        return values, None
+
+    derivatives = (
+        (
+            3.0 * local_coefficients[..., 3] * local_x
+            + 2.0 * local_coefficients[..., 2]
+        )
+        * local_x
+        + local_coefficients[..., 1]
+    ) * (interval_count / (right - left))
+    return values, derivatives
 
 
 def _positive_increments(raw_increments: Tensor) -> Tensor:
@@ -227,7 +320,8 @@ def _objective_derivatives(
         / sample_count
     )
 
-    increment_hessian = quadratic + torch.bmm(
+    increment_hessian = torch.baddbmm(
+        quadratic,
         derivative_basis.transpose(1, 2),
         derivative_basis
         * (reciprocal.square() / sample_count).unsqueeze(2),
@@ -273,6 +367,266 @@ def _objective(
     )
 
 
+def _fit_batch(
+    samples: Tensor,
+    mean: Tensor,
+    scale: Tensor,
+    max_iterations: int,
+) -> _FitBatch:
+    sample_count, dimension_count = samples.shape
+    standardized = (samples - mean) / scale
+    inner_knot_count = max(
+        1,
+        math.ceil(sample_count ** (1.0 / 3.0)),
+    )
+    quantiles = torch.quantile(
+        standardized,
+        standardized.new_tensor((0.1, 0.9)),
+        dim=0,
+    )
+    first, last = quantiles.unbind(dim=0)
+    if torch.any(first >= last):
+        raise ValueError("every input dimension must have varying quantiles")
+
+    positions = torch.linspace(
+        0.0,
+        1.0,
+        inner_knot_count + 2,
+        dtype=samples.dtype,
+        device=samples.device,
+    ).unsqueeze(1)
+    real_knots = first.unsqueeze(0) + (
+        last - first
+    ).unsqueeze(0) * positions
+    knots = torch.cat(
+        (
+            real_knots[:1].repeat(_DEGREE, 1),
+            real_knots,
+            real_knots[-1:].repeat(_DEGREE, 1),
+        ),
+        dim=0,
+    ).T.contiguous()
+
+    left = knots[:, _DEGREE]
+    right = knots[:, -_DEGREE - 1]
+    bounded = torch.maximum(
+        torch.minimum(standardized, right.unsqueeze(0)),
+        left.unsqueeze(0),
+    )
+    design, derivative_basis = _bounded_basis(bounded, knots)
+    basis_count = design.shape[2]
+    design_by_dimension = design.permute(1, 0, 2).contiguous()
+    derivative_by_dimension = derivative_basis.permute(1, 0, 2).contiguous()
+    del standardized, bounded
+    gram = torch.bmm(
+        design_by_dimension.transpose(1, 2),
+        design_by_dimension,
+    )
+    penalty = _smoothing_matrix(basis_count, design)
+    del design
+    scales = torch.sqrt(
+        design_by_dimension.square().sum(dim=(1, 2)) / sample_count
+    )
+    smoothing = (
+        math.exp(2.0) * scales.square()
+    ).unsqueeze(1).unsqueeze(2) * penalty.unsqueeze(0)
+    cumulative_derivative_basis = (
+        derivative_by_dimension.flip(2).cumsum(2).flip(2)
+    )
+    del derivative_basis
+    transformed_gram = gram.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+    transformed_smoothing = (
+        smoothing.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+    )
+    quadratic = (
+        transformed_gram + transformed_smoothing
+    ) / sample_count
+    identity = torch.eye(
+        basis_count,
+        dtype=samples.dtype,
+        device=samples.device,
+    )
+    raw_increments = torch.full(
+        (dimension_count, basis_count),
+        1e-6,
+        dtype=samples.dtype,
+        device=samples.device,
+    )
+
+    tolerance = max(
+        1e-8,
+        10.0 * torch.finfo(samples.dtype).eps**0.5,
+    )
+    objective = _objective(
+        raw_increments,
+        quadratic,
+        cumulative_derivative_basis,
+        sample_count,
+    )
+    for iteration in range(max_iterations):
+        gradient, hessian = _objective_derivatives(
+            raw_increments,
+            quadratic,
+            cumulative_derivative_basis,
+            sample_count,
+        )
+        curvature = torch.maximum(
+            torch.ones(dimension_count, device=samples.device),
+            torch.diagonal(hessian, dim1=1, dim2=2).abs().mean(dim=1),
+        )
+        damping = 1e-8 * curvature
+        selected = torch.zeros(
+            dimension_count,
+            dtype=torch.bool,
+            device=samples.device,
+        )
+        direction = torch.zeros_like(raw_increments)
+        for _ in range(12):
+            candidate = torch.linalg.solve(
+                hessian + damping[:, None, None] * identity,
+                -gradient.unsqueeze(2),
+            ).squeeze(2)
+            valid = (
+                torch.isfinite(candidate).all(dim=1)
+                & ((gradient * candidate).sum(dim=1) < 0)
+                & ~selected
+            )
+            direction = torch.where(valid[:, None], candidate, direction)
+            selected = selected | valid
+            damping = torch.where(selected, damping, damping * 10.0)
+            if bool(torch.all(selected)):
+                break
+        if not bool(torch.all(selected)):
+            raise RuntimeError("could not find a descent direction")
+
+        objective_tolerance = (
+            10.0
+            * torch.finfo(samples.dtype).eps
+            * torch.maximum(torch.ones_like(objective), objective.abs())
+        )
+        slope = (gradient * direction).sum(dim=1)
+        accepted = torch.zeros_like(selected)
+        step = torch.ones_like(objective)
+        accepted_step = torch.zeros_like(step)
+        for _ in range(25):
+            candidate = raw_increments + step[:, None] * direction
+            candidate_objective = _objective(
+                candidate,
+                quadratic,
+                cumulative_derivative_basis,
+                sample_count,
+            )
+            accept = (
+                torch.isfinite(candidate_objective)
+                & (
+                    candidate_objective
+                    <= objective
+                    + 1e-4 * step * slope
+                    + objective_tolerance
+                )
+                & ~accepted
+            )
+            raw_increments = torch.where(
+                accept[:, None],
+                candidate,
+                raw_increments,
+            )
+            objective = torch.where(
+                accept,
+                candidate_objective,
+                objective,
+            )
+            accepted_step = torch.where(accept, step, accepted_step)
+            accepted = accepted | accept
+            step = torch.where(accepted, step, step * 0.5)
+            if bool(torch.all(accepted)):
+                break
+        if not bool(torch.all(accepted)):
+            raise RuntimeError("line search failed")
+
+        if (iteration + 1) % 10 == 0 and iteration + 1 < max_iterations:
+            changes = torch.linalg.vector_norm(
+                accepted_step[:, None] * direction,
+                dim=1,
+            )
+            sizes = torch.linalg.vector_norm(raw_increments, dim=1)
+            if bool(torch.all(changes <= tolerance * (1.0 + sizes))):
+                break
+
+    coefficients = _coefficients(raw_increments).detach()
+    polynomial_coefficients = _polynomial_coefficients(knots, coefficients)
+    _, unpenalized_hessian = _objective_derivatives(
+        raw_increments,
+        transformed_gram,
+        cumulative_derivative_basis,
+        1,
+    )
+    _, penalized_hessian = _objective_derivatives(
+        raw_increments,
+        transformed_gram + transformed_smoothing,
+        cumulative_derivative_basis,
+        1,
+    )
+    ridge = 1e-8 * torch.maximum(
+        torch.ones(dimension_count, device=samples.device),
+        torch.diagonal(
+            penalized_hessian,
+            dim1=1,
+            dim2=2,
+        ).abs().mean(dim=1),
+    )
+    effective_dof = torch.diagonal(
+        torch.linalg.solve(
+            penalized_hessian + ridge[:, None, None] * identity,
+            unpenalized_hessian,
+        ),
+        dim1=1,
+        dim2=2,
+    ).sum(dim=1)
+    mapped = torch.bmm(
+        design_by_dimension,
+        coefficients.unsqueeze(2),
+    ).squeeze(2)
+    derivatives = torch.bmm(
+        derivative_by_dimension,
+        coefficients.unsqueeze(2),
+    ).squeeze(2)
+    nll = (
+        0.5 * mapped.square().sum(dim=1)
+        - torch.log(derivatives).sum(dim=1)
+    )
+    correction = effective_dof * (effective_dof + 1.0) / torch.clamp(
+        sample_count - effective_dof - 1.0,
+        min=1e-12,
+    )
+    left_design, left_derivative_design = _bounded_basis(
+        left.unsqueeze(0),
+        knots,
+    )
+    right_design, right_derivative_design = _bounded_basis(
+        right.unsqueeze(0),
+        knots,
+    )
+    return _FitBatch(
+        knots=knots,
+        raw_coefficients=raw_increments.detach(),
+        polynomial_coefficients=polynomial_coefficients.detach(),
+        effective_dof=effective_dof.detach(),
+        aicc=(2.0 * (nll + effective_dof + correction)).detach(),
+        nll=nll.detach(),
+        left_values=torch.sum(left_design[0] * coefficients, dim=1),
+        right_values=torch.sum(right_design[0] * coefficients, dim=1),
+        left_derivatives=torch.sum(
+            left_derivative_design[0] * coefficients,
+            dim=1,
+        ),
+        right_derivatives=torch.sum(
+            right_derivative_design[0] * coefficients,
+            dim=1,
+        ),
+    )
+
+
 class BatchedDiagonalSplineTransport(nn.Module):
     """Cubic P-spline transport for about 12,000 independent parameters.
 
@@ -285,6 +639,8 @@ class BatchedDiagonalSplineTransport(nn.Module):
         "scale_",
         "knots_",
         "raw_coefficients_",
+        "polynomial_coefficients_",
+        "interval_offsets_",
         "effective_dof_",
         "aicc_",
         "nll_",
@@ -294,8 +650,15 @@ class BatchedDiagonalSplineTransport(nn.Module):
         "right_derivatives_",
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_fit_iterations: int = _DEFAULT_FIT_ITERATIONS,
+    ) -> None:
         super().__init__()
+        if max_fit_iterations < 1:
+            raise ValueError("max_fit_iterations must be at least 1")
+        self.max_fit_iterations = max_fit_iterations
         for name in self._buffer_names:
             self.register_buffer(name, None)
         self.n_samples_seen_: int | None = None
@@ -334,6 +697,23 @@ class BatchedDiagonalSplineTransport(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+        if (
+            self.polynomial_coefficients_ is None
+            and self.knots_ is not None
+            and self.raw_coefficients_ is not None
+        ):
+            coefficients = _coefficients(self.raw_coefficients_)
+            self.polynomial_coefficients_ = _polynomial_coefficients(
+                self.knots_,
+                coefficients,
+            )
+            self.interval_offsets_ = (
+                torch.arange(
+                    self.knots_.shape[0],
+                    device=self.knots_.device,
+                )
+                * self.polynomial_coefficients_.shape[1]
+            ).unsqueeze(0)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -389,269 +769,61 @@ class BatchedDiagonalSplineTransport(nn.Module):
         if torch.any(scale <= torch.finfo(samples.dtype).eps):
             raise ValueError("every input dimension must have non-zero variance")
 
-        standardized = (samples - mean) / scale
-        inner_knot_count = max(
-            1,
-            math.ceil(sample_count ** (1.0 / 3.0)),
-        )
-        quantiles = torch.quantile(
-            standardized,
-            standardized.new_tensor((0.1, 0.9)),
-            dim=0,
-        )
-        first, last = quantiles.unbind(dim=0)
-        if torch.any(first >= last):
-            raise ValueError("every input dimension must have varying quantiles")
-
-        positions = torch.linspace(
-            0.0,
-            1.0,
-            inner_knot_count + 2,
-            dtype=samples.dtype,
-            device=samples.device,
-        ).unsqueeze(1)
-        real_knots = first.unsqueeze(0) + (
-            last - first
-        ).unsqueeze(0) * positions
-        knots = torch.cat(
-            (
-                real_knots[:1].repeat(_DEGREE, 1),
-                real_knots,
-                real_knots[-1:].repeat(_DEGREE, 1),
-            ),
-            dim=0,
-        ).T.contiguous()
-
-        left = knots[:, _DEGREE]
-        right = knots[:, -_DEGREE - 1]
-        bounded = torch.maximum(
-            torch.minimum(standardized, right.unsqueeze(0)),
-            left.unsqueeze(0),
-        )
-        design, derivative_basis = _bounded_basis(bounded, knots)
-        basis_count = design.shape[2]
-        design_by_dimension = design.permute(1, 0, 2).contiguous()
-        derivative_by_dimension = derivative_basis.permute(1, 0, 2).contiguous()
-        del standardized, bounded
-        gram = torch.bmm(
-            design_by_dimension.transpose(1, 2),
-            design_by_dimension,
-        )
-        penalty = _smoothing_matrix(basis_count, design)
-        del design
-        scales = torch.sqrt(
-            design_by_dimension.square().sum(dim=(1, 2)) / sample_count
-        )
-        smoothing = (
-            math.exp(2.0) * scales.square()
-        ).unsqueeze(1).unsqueeze(2) * penalty.unsqueeze(0)
-        cumulative_derivative_basis = (
-            derivative_by_dimension.flip(2).cumsum(2).flip(2)
-        )
-        del derivative_basis
-        transformed_gram = gram.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
-        transformed_smoothing = (
-            smoothing.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
-        )
-        quadratic = (
-            transformed_gram + transformed_smoothing
-        ) / sample_count
-        identity = torch.eye(
-            basis_count,
-            dtype=samples.dtype,
-            device=samples.device,
-        )
-        raw_increments = torch.full(
-            (dimension_count, basis_count),
-            1e-6,
-            dtype=samples.dtype,
-            device=samples.device,
-        )
-
-        tolerance = max(
-            1e-8,
-            10.0 * torch.finfo(samples.dtype).eps**0.5,
-        )
-        for iteration in range(_INNER_MAX_ITERATIONS):
-            gradient, hessian = _objective_derivatives(
-                raw_increments,
-                quadratic,
-                cumulative_derivative_basis,
-                sample_count,
+        batches = [
+            _fit_batch(
+                samples[:, start : start + _FIT_DIMENSION_BATCH_SIZE],
+                mean[start : start + _FIT_DIMENSION_BATCH_SIZE],
+                scale[start : start + _FIT_DIMENSION_BATCH_SIZE],
+                self.max_fit_iterations,
             )
-            curvature = torch.maximum(
-                torch.ones(dimension_count, device=samples.device),
-                torch.diagonal(hessian, dim1=1, dim2=2).abs().mean(dim=1),
-            )
-            damping = 1e-8 * curvature
-            selected = torch.zeros(
-                dimension_count,
-                dtype=torch.bool,
-                device=samples.device,
-            )
-            direction = torch.zeros_like(raw_increments)
-            for _ in range(12):
-                candidate = torch.linalg.solve(
-                    hessian + damping[:, None, None] * identity,
-                    -gradient.unsqueeze(2),
-                ).squeeze(2)
-                valid = (
-                    torch.isfinite(candidate).all(dim=1)
-                    & ((gradient * candidate).sum(dim=1) < 0)
-                    & ~selected
-                )
-                direction = torch.where(valid[:, None], candidate, direction)
-                selected = selected | valid
-                damping = torch.where(selected, damping, damping * 10.0)
-                if bool(torch.all(selected)):
-                    break
-            if not bool(torch.all(selected)):
-                raise RuntimeError("could not find a descent direction")
-
-            objective = _objective(
-                raw_increments,
-                quadratic,
-                cumulative_derivative_basis,
-                sample_count,
-            )
-            objective_tolerance = (
-                10.0
-                * torch.finfo(samples.dtype).eps
-                * torch.maximum(torch.ones_like(objective), objective.abs())
-            )
-            slope = (gradient * direction).sum(dim=1)
-            accepted = torch.zeros_like(selected)
-            step = torch.ones_like(objective)
-            accepted_step = torch.zeros_like(step)
-            for _ in range(25):
-                candidate = raw_increments + step[:, None] * direction
-                candidate_objective = _objective(
-                    candidate,
-                    quadratic,
-                    cumulative_derivative_basis,
-                    sample_count,
-                )
-                accept = (
-                    torch.isfinite(candidate_objective)
-                    & (
-                        candidate_objective
-                        <= objective
-                        + 1e-4 * step * slope
-                        + objective_tolerance
-                    )
-                    & ~accepted
-                )
-                raw_increments = torch.where(
-                    accept[:, None],
-                    candidate,
-                    raw_increments,
-                )
-                accepted_step = torch.where(accept, step, accepted_step)
-                accepted = accepted | accept
-                step = torch.where(accepted, step, step * 0.5)
-                if bool(torch.all(accepted)):
-                    break
-            if not bool(torch.all(accepted)):
-                raise RuntimeError("line search failed")
-
-            if (iteration + 1) % 10 == 0:
-                changes = torch.linalg.vector_norm(
-                    accepted_step[:, None] * direction,
-                    dim=1,
-                )
-                sizes = torch.linalg.vector_norm(raw_increments, dim=1)
-                if bool(torch.all(changes <= tolerance * (1.0 + sizes))):
-                    break
-
-        coefficients = _coefficients(raw_increments).detach()
-        _, unpenalized_hessian = _objective_derivatives(
-            raw_increments,
-            transformed_gram,
-            cumulative_derivative_basis,
-            1,
-        )
-        _, penalized_hessian = _objective_derivatives(
-            raw_increments,
-            transformed_gram + transformed_smoothing,
-            cumulative_derivative_basis,
-            1,
-        )
-        ridge = 1e-8 * torch.maximum(
-            torch.ones(dimension_count, device=samples.device),
-            torch.diagonal(
-                penalized_hessian,
-                dim1=1,
-                dim2=2,
-            ).abs().mean(dim=1),
-        )
-        effective_dof = torch.diagonal(
-            torch.linalg.solve(
-                penalized_hessian + ridge[:, None, None] * identity,
-                unpenalized_hessian,
-            ),
-            dim1=1,
-            dim2=2,
-        ).sum(dim=1)
-        mapped = torch.bmm(
-            design_by_dimension,
-            coefficients.unsqueeze(2),
-        ).squeeze(2)
-        derivatives = torch.bmm(
-            derivative_by_dimension,
-            coefficients.unsqueeze(2),
-        ).squeeze(2)
-        nll = (
-            0.5 * mapped.square().sum(dim=1)
-            - torch.log(derivatives).sum(dim=1)
-        )
-        correction = effective_dof * (effective_dof + 1.0) / torch.clamp(
-            sample_count - effective_dof - 1.0,
-            min=1e-12,
-        )
-        left_design, left_derivative_design = _bounded_basis(
-            left.unsqueeze(0),
-            knots,
-        )
-        right_design, right_derivative_design = _bounded_basis(
-            right.unsqueeze(0),
-            knots,
-        )
+            for start in range(0, dimension_count, _FIT_DIMENSION_BATCH_SIZE)
+        ]
 
         self.n_samples_seen_ = sample_count
         self.n_features_in_ = dimension_count
         self.mean_ = mean
         self.scale_ = scale
-        self.knots_ = knots
-        self.raw_coefficients_ = raw_increments.detach()
-        self.effective_dof_ = effective_dof.detach()
-        self.aicc_ = (2.0 * (nll + effective_dof + correction)).detach()
-        self.nll_ = nll.detach()
-        self.left_values_ = torch.sum(
-            left_design[0] * coefficients,
-            dim=1,
+        self.knots_ = torch.cat([batch.knots for batch in batches])
+        self.raw_coefficients_ = torch.cat(
+            [batch.raw_coefficients for batch in batches]
         )
-        self.right_values_ = torch.sum(
-            right_design[0] * coefficients,
-            dim=1,
+        self.polynomial_coefficients_ = torch.cat(
+            [batch.polynomial_coefficients for batch in batches]
         )
-        self.left_derivatives_ = torch.sum(
-            left_derivative_design[0] * coefficients,
-            dim=1,
+        self.interval_offsets_ = (
+            torch.arange(dimension_count, device=samples.device)
+            * self.polynomial_coefficients_.shape[1]
+        ).unsqueeze(0)
+        self.effective_dof_ = torch.cat(
+            [batch.effective_dof for batch in batches]
         )
-        self.right_derivatives_ = torch.sum(
-            right_derivative_design[0] * coefficients,
-            dim=1,
+        self.aicc_ = torch.cat([batch.aicc for batch in batches])
+        self.nll_ = torch.cat([batch.nll for batch in batches])
+        self.left_values_ = torch.cat(
+            [batch.left_values for batch in batches]
+        )
+        self.right_values_ = torch.cat(
+            [batch.right_values for batch in batches]
+        )
+        self.left_derivatives_ = torch.cat(
+            [batch.left_derivatives for batch in batches]
+        )
+        self.right_derivatives_ = torch.cat(
+            [batch.right_derivatives for batch in batches]
         )
         return self
 
     def _evaluate(
         self,
         x: Tensor,
-        coefficients: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        *,
+        with_derivatives: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
         assert (
             self.knots_ is not None
             and self.raw_coefficients_ is not None
+            and self.polynomial_coefficients_ is not None
+            and self.interval_offsets_ is not None
             and self.left_values_ is not None
             and self.right_values_ is not None
             and self.left_derivatives_ is not None
@@ -663,12 +835,12 @@ class BatchedDiagonalSplineTransport(nn.Module):
             torch.minimum(x, right.unsqueeze(0)),
             left.unsqueeze(0),
         )
-        if coefficients is None:
-            coefficients = _coefficients(self.raw_coefficients_)
-        values, derivatives = _bounded_evaluate(
+        values, derivatives = _polynomial_evaluate(
             bounded,
             self.knots_,
-            coefficients,
+            self.polynomial_coefficients_,
+            self.interval_offsets_,
+            with_derivatives=with_derivatives,
         )
 
         below = x < left.unsqueeze(0)
@@ -685,22 +857,26 @@ class BatchedDiagonalSplineTransport(nn.Module):
             + (x - right.unsqueeze(0)) * self.right_derivatives_.unsqueeze(0),
             values,
         )
-        derivatives = torch.where(
-            below,
-            self.left_derivatives_.unsqueeze(0),
-            derivatives,
-        )
-        derivatives = torch.where(
-            above,
-            self.right_derivatives_.unsqueeze(0),
-            derivatives,
-        )
+        if derivatives is not None:
+            derivatives = torch.where(
+                below,
+                self.left_derivatives_.unsqueeze(0),
+                derivatives,
+            )
+            derivatives = torch.where(
+                above,
+                self.right_derivatives_.unsqueeze(0),
+                derivatives,
+            )
         return values, derivatives
 
     def forward(self, X: Tensor) -> Tensor:
         self._validate_input(X, "X")
         assert self.mean_ is not None and self.scale_ is not None
-        return self._evaluate((X - self.mean_) / self.scale_)[0]
+        return self._evaluate(
+            (X - self.mean_) / self.scale_,
+            with_derivatives=False,
+        )[0]
 
     def inverse(self, Z: Tensor) -> Tensor:
         self._validate_input(Z, "Z")
@@ -716,9 +892,10 @@ class BatchedDiagonalSplineTransport(nn.Module):
         left = self.knots_[:, _DEGREE]
         right = self.knots_[:, -_DEGREE - 1]
         epsilon = 100.0 * torch.finfo(Z.dtype).eps
-        if torch.any(self.left_derivatives_ <= epsilon) or torch.any(
+        invalid_tail_slope = (self.left_derivatives_ <= epsilon) | (
             self.right_derivatives_ <= epsilon
-        ):
+        )
+        if torch.any(invalid_tail_slope):
             raise RuntimeError("the fitted map has a non-positive tail slope")
 
         below = Z < self.left_values_.unsqueeze(0)
@@ -734,15 +911,15 @@ class BatchedDiagonalSplineTransport(nn.Module):
             left.unsqueeze(0),
         )
 
-        assert self.raw_coefficients_ is not None
-        coefficients = _coefficients(self.raw_coefficients_)
         iterations = 24 if Z.dtype == torch.float32 else 40
-        for _ in range(min(_INVERSE_ITERATIONS, iterations)):
-            values, slopes = _bounded_evaluate(
+        for iteration in range(min(_INVERSE_ITERATIONS, iterations)):
+            values, slopes = _polynomial_evaluate(
                 middle,
                 self.knots_,
-                coefficients,
+                self.polynomial_coefficients_,
+                self.interval_offsets_,
             )
+            assert slopes is not None
             low = torch.where(values < Z, middle, low)
             high = torch.where(values >= Z, middle, high)
             root_tolerance = (
@@ -754,7 +931,7 @@ class BatchedDiagonalSplineTransport(nn.Module):
             converged = below | above | (
                 (values - Z).abs() <= root_tolerance
             )
-            if bool(torch.all(converged)):
+            if (iteration + 1) % 4 == 0 and bool(torch.all(converged)):
                 break
             newton = middle - (values - Z) / slopes
             valid = (
@@ -775,7 +952,8 @@ class BatchedDiagonalSplineTransport(nn.Module):
         result = torch.where(above, right_tail, result)
 
         root = result.detach()
-        root_value, root_slope = self._evaluate(root, coefficients)
+        root_value, root_slope = self._evaluate(root)
+        assert root_slope is not None
         standardized = root + (Z - root_value) / root_slope.detach()
         return standardized * self.scale_ + self.mean_
 
