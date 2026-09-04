@@ -57,6 +57,37 @@ when fit quality is more important than throughput:
 transport = BatchedDiagonalSplineTransport(max_fit_iterations=20).fit(samples)
 ```
 
+For sparse multiscale conditional dependence, the boosted wavelet transport
+keeps physical variables on the monotone diagonal and adds causal Haar spline
+features from preceding variables:
+
+```python
+from expr07_tria import BoostedWaveletSplineTransport
+
+transport = BoostedWaveletSplineTransport(
+    max_wavelet_level=6,
+    max_parent_distance=256,
+    max_learners_per_component=4,
+    block_size=256,
+).fit(samples)
+
+conditioned = transport.conditional_inverse(samples[:, :1], reference[:, 1:])
+exceedances = transport.sample_exceedance(
+    component=0,
+    threshold=1.0,
+    sample_count=100,
+)
+```
+
+For large GPU workloads, `block_size` groups mapped components that share the
+same preceding parent variables. Fitting and inversion are vectorized within
+each block, so 12,000 components with `block_size=256` require only about 47
+sequential inverse stages. The default `block_size=1` preserves scalar
+triangular behavior. Wavelet supports are always restricted to preceding
+blocks, which preserves exact inversion. Exact exceedance sampling currently
+supports the leading component; later-component inequalities require
+sequential importance sampling.
+
 For conditional sampling, place conditioned variables first and set
 `skip_dimensions` to their count:
 
@@ -73,3 +104,28 @@ conditional_samples = transport.conditional_inverse(fixed_values, reference)
 logarithms of smoothing penalties. One smoothing value is fitted for every
 active additive spline block. Fitted coefficients and diagnostics are
 available through `coefficients_`, `effective_dof_`, `aicc_`, and `nll_`.
+
+## SmolLM3 hidden-state steering
+
+`smollm3_hidden_steering.py` captures the last-token hidden state immediately
+before `lm_head` computes the next-token logits. It samples a local cloud,
+fits a diagonal spline transport, and repeatedly refits it to states that
+combine low next-token entropy with high fitted density. Candidate norms are
+matched to the original hidden state before evaluation.
+
+```bash
+uv run python smollm3_hidden_steering.py \
+  "Explain why the sky is blue." \
+  --samples 256 \
+  --iterations 2 \
+  --elite-fraction 0.25 \
+  --noise-scale 0.05 \
+  --density-weight 1.0 \
+  --seed 7
+```
+
+`Transport.last_hidden_state` contains the unmodified state, while
+`last_steered_hidden_state` contains the selected vector passed to `lm_head`.
+For each generation step, the script writes the original greedy token and the
+token selected after transport, including their IDs and decoded text, to
+standard error.

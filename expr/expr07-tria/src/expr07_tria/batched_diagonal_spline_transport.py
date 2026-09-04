@@ -44,12 +44,11 @@ def _bounded_basis(x: Tensor, knots: Tensor) -> tuple[Tensor, Tensor]:
     lower_values: Tensor | None = None
     for level in range(1, _DEGREE + 1):
         size = knot_count - level - 1
-        left_denominator = (
-            knots[:, level : level + size] - knots[:, :size]
-        ).unsqueeze(0)
+        left_denominator = (knots[:, level : level + size] - knots[:, :size]).unsqueeze(
+            0
+        )
         right_denominator = (
-            knots[:, level + 1 : level + 1 + size]
-            - knots[:, 1 : 1 + size]
+            knots[:, level + 1 : level + 1 + size] - knots[:, 1 : 1 + size]
         ).unsqueeze(0)
 
         safe_left = torch.where(
@@ -71,10 +70,7 @@ def _bounded_basis(x: Tensor, knots: Tensor) -> tuple[Tensor, Tensor]:
         )
         right = torch.where(
             right_denominator != 0,
-            (
-                knots[:, level + 1 : level + 1 + size].unsqueeze(0)
-                - x.unsqueeze(-1)
-            )
+            (knots[:, level + 1 : level + 1 + size].unsqueeze(0) - x.unsqueeze(-1))
             / safe_right
             * values[..., 1 : size + 1],
             torch.zeros_like(values[..., :size]),
@@ -109,9 +105,7 @@ def _bounded_basis(x: Tensor, knots: Tensor) -> tuple[Tensor, Tensor]:
     right_values = torch.zeros_like(values)
     right_values[..., -1] = 1.0
     right_derivatives = torch.zeros_like(derivatives)
-    final_slope = _DEGREE / (
-        knots[:, basis_count] - knots[:, basis_count - 1]
-    )
+    final_slope = _DEGREE / (knots[:, basis_count] - knots[:, basis_count - 1])
     right_derivatives[..., -2] = -final_slope.unsqueeze(0)
     right_derivatives[..., -1] = final_slope.unsqueeze(0)
     values = torch.where(at_right.unsqueeze(-1), right_values, values)
@@ -142,13 +136,14 @@ def _bounded_basis_evaluate(
 
     levels = torch.arange(1, _DEGREE + 1, device=x.device)
     dimensions = torch.arange(knots.shape[0], device=x.device)[None, :, None]
-    left_distances = x.unsqueeze(2) - knots[
-        dimensions,
-        spans.unsqueeze(2) + 1 - levels,
-    ]
-    right_distances = (
-        knots[dimensions, spans.unsqueeze(2) + levels] - x.unsqueeze(2)
+    left_distances = (
+        x.unsqueeze(2)
+        - knots[
+            dimensions,
+            spans.unsqueeze(2) + 1 - levels,
+        ]
     )
+    right_distances = knots[dimensions, spans.unsqueeze(2) + levels] - x.unsqueeze(2)
 
     local_basis = torch.ones_like(x).unsqueeze(2)
     lower_basis: Tensor | None = None
@@ -157,8 +152,7 @@ def _bounded_basis_evaluate(
         next_basis = []
         for index in range(level):
             denominator = (
-                right_distances[..., index]
-                + left_distances[..., level - index - 1]
+                right_distances[..., index] + left_distances[..., level - index - 1]
             )
             ratio = torch.where(
                 denominator != 0,
@@ -181,8 +175,7 @@ def _bounded_basis_evaluate(
         return values, None
 
     alpha_denominator = (
-        knots[dimensions, knot_indices + _DEGREE]
-        - knots[dimensions, knot_indices]
+        knots[dimensions, knot_indices + _DEGREE] - knots[dimensions, knot_indices]
     )
     beta_denominator = (
         knots[dimensions, knot_indices + _DEGREE + 1]
@@ -198,9 +191,8 @@ def _bounded_basis_evaluate(
         _DEGREE / beta_denominator,
         torch.zeros_like(beta_denominator),
     )
-    local_derivatives = (
-        alpha * F.pad(lower_basis, (1, 0))
-        - beta * F.pad(lower_basis, (0, 1))
+    local_derivatives = alpha * F.pad(lower_basis, (1, 0)) - beta * F.pad(
+        lower_basis, (0, 1)
     )
     derivatives = torch.sum(local_derivatives * local_coefficients, dim=2)
     return values, derivatives
@@ -212,11 +204,9 @@ def _polynomial_coefficients(knots: Tensor, coefficients: Tensor) -> Tensor:
     interval_count = basis_count - _DEGREE
     edges = knots[:, _DEGREE : basis_count + 1]
     nodes = knots.new_tensor((0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0))
-    points = (
-        edges[:, :-1].unsqueeze(0)
-        + nodes[:, None, None]
-        * (edges[:, 1:] - edges[:, :-1]).unsqueeze(0)
-    )
+    points = edges[:, :-1].unsqueeze(0) + nodes[:, None, None] * (
+        edges[:, 1:] - edges[:, :-1]
+    ).unsqueeze(0)
     values, _ = _bounded_basis_evaluate(
         points.permute(2, 0, 1).reshape(-1, knots.shape[0]),
         knots,
@@ -248,9 +238,13 @@ def _polynomial_evaluate(
     left = knots[:, _DEGREE]
     right = knots[:, -_DEGREE - 1]
     scaled = (x - left) / (right - left) * interval_count
-    intervals = torch.floor(scaled).to(torch.long).clamp(
-        min=0,
-        max=interval_count - 1,
+    intervals = (
+        torch.floor(scaled)
+        .to(torch.long)
+        .clamp(
+            min=0,
+            max=interval_count - 1,
+        )
     )
     local_x = scaled - intervals
     local_coefficients = F.embedding(
@@ -258,21 +252,14 @@ def _polynomial_evaluate(
         polynomial_coefficients.flatten(0, 1),
     )
     values = (
-        (
-            local_coefficients[..., 3] * local_x
-            + local_coefficients[..., 2]
-        )
-        * local_x
+        (local_coefficients[..., 3] * local_x + local_coefficients[..., 2]) * local_x
         + local_coefficients[..., 1]
     ) * local_x + local_coefficients[..., 0]
     if not with_derivatives:
         return values, None
 
     derivatives = (
-        (
-            3.0 * local_coefficients[..., 3] * local_x
-            + 2.0 * local_coefficients[..., 2]
-        )
+        (3.0 * local_coefficients[..., 3] * local_x + 2.0 * local_coefficients[..., 2])
         * local_x
         + local_coefficients[..., 1]
     ) * (interval_count / (right - left))
@@ -323,8 +310,7 @@ def _objective_derivatives(
     increment_hessian = torch.baddbmm(
         quadratic,
         derivative_basis.transpose(1, 2),
-        derivative_basis
-        * (reciprocal.square() / sample_count).unsqueeze(2),
+        derivative_basis * (reciprocal.square() / sample_count).unsqueeze(2),
     )
 
     sigmoid = torch.sigmoid(raw_increments[:, 1:])
@@ -339,10 +325,9 @@ def _objective_derivatives(
         ),
         dim=1,
     )
-    hessian = (
-        increment_hessian * slopes.unsqueeze(1) * slopes.unsqueeze(2)
-        + torch.diag_embed(curvatures * increment_gradient)
-    )
+    hessian = increment_hessian * slopes.unsqueeze(1) * slopes.unsqueeze(
+        2
+    ) + torch.diag_embed(curvatures * increment_gradient)
     return slopes * increment_gradient, hessian
 
 
@@ -395,9 +380,7 @@ def _fit_batch(
         dtype=samples.dtype,
         device=samples.device,
     ).unsqueeze(1)
-    real_knots = first.unsqueeze(0) + (
-        last - first
-    ).unsqueeze(0) * positions
+    real_knots = first.unsqueeze(0) + (last - first).unsqueeze(0) * positions
     knots = torch.cat(
         (
             real_knots[:1].repeat(_DEGREE, 1),
@@ -424,23 +407,15 @@ def _fit_batch(
     )
     penalty = _smoothing_matrix(basis_count, design)
     del design
-    scales = torch.sqrt(
-        design_by_dimension.square().sum(dim=(1, 2)) / sample_count
-    )
-    smoothing = (
-        math.exp(2.0) * scales.square()
-    ).unsqueeze(1).unsqueeze(2) * penalty.unsqueeze(0)
-    cumulative_derivative_basis = (
-        derivative_by_dimension.flip(2).cumsum(2).flip(2)
-    )
+    scales = torch.sqrt(design_by_dimension.square().sum(dim=(1, 2)) / sample_count)
+    smoothing = (math.exp(2.0) * scales.square()).unsqueeze(1).unsqueeze(
+        2
+    ) * penalty.unsqueeze(0)
+    cumulative_derivative_basis = derivative_by_dimension.flip(2).cumsum(2).flip(2)
     del derivative_basis
     transformed_gram = gram.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
-    transformed_smoothing = (
-        smoothing.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
-    )
-    quadratic = (
-        transformed_gram + transformed_smoothing
-    ) / sample_count
+    transformed_smoothing = smoothing.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+    quadratic = (transformed_gram + transformed_smoothing) / sample_count
     identity = torch.eye(
         basis_count,
         dtype=samples.dtype,
@@ -455,7 +430,7 @@ def _fit_batch(
 
     tolerance = max(
         1e-8,
-        10.0 * torch.finfo(samples.dtype).eps**0.5,
+        10.0 * torch.finfo(samples.dtype).eps ** 0.5,
     )
     objective = _objective(
         raw_increments,
@@ -520,9 +495,7 @@ def _fit_batch(
                 torch.isfinite(candidate_objective)
                 & (
                     candidate_objective
-                    <= objective
-                    + 1e-4 * step * slope
-                    + objective_tolerance
+                    <= objective + 1e-4 * step * slope + objective_tolerance
                 )
                 & ~accepted
             )
@@ -573,7 +546,9 @@ def _fit_batch(
             penalized_hessian,
             dim1=1,
             dim2=2,
-        ).abs().mean(dim=1),
+        )
+        .abs()
+        .mean(dim=1),
     )
     effective_dof = torch.diagonal(
         torch.linalg.solve(
@@ -591,13 +566,14 @@ def _fit_batch(
         derivative_by_dimension,
         coefficients.unsqueeze(2),
     ).squeeze(2)
-    nll = (
-        0.5 * mapped.square().sum(dim=1)
-        - torch.log(derivatives).sum(dim=1)
-    )
-    correction = effective_dof * (effective_dof + 1.0) / torch.clamp(
-        sample_count - effective_dof - 1.0,
-        min=1e-12,
+    nll = 0.5 * mapped.square().sum(dim=1) - torch.log(derivatives).sum(dim=1)
+    correction = (
+        effective_dof
+        * (effective_dof + 1.0)
+        / torch.clamp(
+            sample_count - effective_dof - 1.0,
+            min=1e-12,
+        )
     )
     left_design, left_derivative_design = _bounded_basis(
         left.unsqueeze(0),
@@ -630,8 +606,8 @@ def _fit_batch(
 class BatchedDiagonalSplineTransport(nn.Module):
     """Cubic P-spline transport for about 12,000 independent parameters.
 
-    Input tensors have shape ``(samples, parameters)`` and must contain at
-    least 64 samples. Fitting and map evaluation stay on the input device.
+    Input tensors have shape ``(samples, parameters)``. Fitting and map
+    evaluation stay on the input device.
     """
 
     _buffer_names = (
@@ -736,18 +712,14 @@ class BatchedDiagonalSplineTransport(nn.Module):
         if not isinstance(value, Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
         if value.ndim != 2 or value.shape[1] != self.n_features_in_:
-            raise ValueError(
-                f"{name} must have shape (N, {self.n_features_in_})"
-            )
+            raise ValueError(f"{name} must have shape (N, {self.n_features_in_})")
         if value.device != self.device:
             raise ValueError(
-                f"{name} is on {value.device}, but the transport is on "
-                f"{self.device}"
+                f"{name} is on {value.device}, but the transport is on {self.device}"
             )
         if value.dtype != self.dtype:
             raise ValueError(
-                f"{name} has dtype {value.dtype}, but the transport uses "
-                f"{self.dtype}"
+                f"{name} has dtype {value.dtype}, but the transport uses {self.dtype}"
             )
 
     def fit(self, X: Tensor) -> BatchedDiagonalSplineTransport:
@@ -757,8 +729,6 @@ class BatchedDiagonalSplineTransport(nn.Module):
             raise TypeError("X must have a floating-point dtype")
         if X.ndim != 2:
             raise ValueError("X must have shape (N, D)")
-        if X.shape[0] < 64:
-            raise ValueError("at least 64 samples are required")
         if not torch.all(torch.isfinite(X)):
             raise ValueError("X must contain only finite values")
 
@@ -794,17 +764,11 @@ class BatchedDiagonalSplineTransport(nn.Module):
             torch.arange(dimension_count, device=samples.device)
             * self.polynomial_coefficients_.shape[1]
         ).unsqueeze(0)
-        self.effective_dof_ = torch.cat(
-            [batch.effective_dof for batch in batches]
-        )
+        self.effective_dof_ = torch.cat([batch.effective_dof for batch in batches])
         self.aicc_ = torch.cat([batch.aicc for batch in batches])
         self.nll_ = torch.cat([batch.nll for batch in batches])
-        self.left_values_ = torch.cat(
-            [batch.left_values for batch in batches]
-        )
-        self.right_values_ = torch.cat(
-            [batch.right_values for batch in batches]
-        )
+        self.left_values_ = torch.cat([batch.left_values for batch in batches])
+        self.right_values_ = torch.cat([batch.right_values for batch in batches])
         self.left_derivatives_ = torch.cat(
             [batch.left_derivatives for batch in batches]
         )
@@ -878,6 +842,21 @@ class BatchedDiagonalSplineTransport(nn.Module):
             with_derivatives=False,
         )[0]
 
+    def log_prob(self, X: Tensor) -> Tensor:
+        """Evaluate the fitted independent density for each row of ``X``."""
+        self._validate_input(X, "X")
+        assert self.mean_ is not None and self.scale_ is not None
+        standardized = (X - self.mean_) / self.scale_
+        reference, derivatives = self._evaluate(standardized)
+        assert derivatives is not None
+        if torch.any(derivatives <= 0):
+            raise RuntimeError("the fitted map has a non-positive derivative")
+        log_reference_density = -0.5 * (
+            reference.square() + math.log(2.0 * math.pi)
+        )
+        log_jacobian = torch.log(derivatives) - torch.log(self.scale_)
+        return (log_reference_density + log_jacobian).sum(dim=1)
+
     def inverse(self, Z: Tensor) -> Tensor:
         self._validate_input(Z, "Z")
         assert (
@@ -923,14 +902,9 @@ class BatchedDiagonalSplineTransport(nn.Module):
             low = torch.where(values < Z, middle, low)
             high = torch.where(values >= Z, middle, high)
             root_tolerance = (
-                4.0
-                * torch.finfo(Z.dtype).eps
-                * (1.0 + middle.abs())
-                * slopes.abs()
+                4.0 * torch.finfo(Z.dtype).eps * (1.0 + middle.abs()) * slopes.abs()
             )
-            converged = below | above | (
-                (values - Z).abs() <= root_tolerance
-            )
+            converged = below | above | ((values - Z).abs() <= root_tolerance)
             if (iteration + 1) % 4 == 0 and bool(torch.all(converged)):
                 break
             newton = middle - (values - Z) / slopes

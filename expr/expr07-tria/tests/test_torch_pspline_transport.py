@@ -233,15 +233,25 @@ def test_float32_fit_scales_to_production_sample_count() -> None:
     assert torch.allclose(reconstructed, samples, atol=2e-5, rtol=2e-5)
 
 
-def test_batched_transport_requires_at_least_64_samples() -> None:
-    samples = torch.randn(63, 10, dtype=torch.float32)
+def test_batched_transport_log_prob_matches_change_of_variables() -> None:
+    samples = torch.randn(
+        64,
+        4,
+        generator=torch.Generator().manual_seed(41),
+        dtype=torch.float64,
+    )
+    transport = BatchedDiagonalSplineTransport().fit(samples)
+    points = samples[:5]
 
-    try:
-        BatchedDiagonalSplineTransport().fit(samples)
-    except ValueError as error:
-        assert "at least 64 samples" in str(error)
-    else:
-        raise AssertionError("undersized training data should be rejected")
+    standardized_points = (points - transport.mean_) / transport.scale_
+    reference, derivatives = transport._evaluate(standardized_points)
+    expected = (
+        -0.5 * (reference.square() + torch.log(torch.tensor(2.0 * torch.pi)))
+        + torch.log(derivatives)
+        - torch.log(transport.scale_)
+    ).sum(dim=1)
+
+    assert torch.allclose(transport.log_prob(points), expected)
 
 
 def test_batched_transport_validates_fit_iterations() -> None:

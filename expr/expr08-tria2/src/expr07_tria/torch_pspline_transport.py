@@ -2360,10 +2360,15 @@ class AdaptiveSplineTransport(nn.Module):
         epsilon = 100.0 * torch.finfo(reference.dtype).eps
         below = reference < diagonal.left_values.unsqueeze(0)
         above = reference > diagonal.right_values.unsqueeze(0)
-        interval = torch.sum(
-            reference.unsqueeze(-1) >= diagonal.break_values.unsqueeze(0),
-            dim=-1,
-        ) - 1
+        interior = ~(below | above)
+        interval = (
+            torch.searchsorted(
+                diagonal.break_values,
+                reference.T.contiguous(),
+                right=True,
+            ).T.contiguous()
+            - 1
+        )
         interval = interval.clamp(
             min=0,
             max=diagonal.breakpoints.shape[1] - 2,
@@ -2384,6 +2389,7 @@ class AdaptiveSplineTransport(nn.Module):
         )
         middle = low + fraction.clamp(min=0.0, max=1.0) * (high - low)
         required_iterations = 12 if reference.dtype == torch.float32 else 24
+        root_tolerance = math.sqrt(torch.finfo(reference.dtype).eps)
         for _ in range(min(self.inverse_iterations, required_iterations)):
             values, slopes = _batched_diagonal_evaluate(
                 middle,
@@ -2391,9 +2397,22 @@ class AdaptiveSplineTransport(nn.Module):
                 self.degree,
             )
             residual = values - reference
+            newton_step = residual / slopes
+            if reference.device.type == "cpu" and torch.all(
+                ~interior
+                | (
+                    newton_step.abs()
+                    <= root_tolerance
+                    * torch.maximum(
+                        torch.ones_like(middle),
+                        middle.abs(),
+                    )
+                )
+            ):
+                break
             low = torch.where(values < reference, middle, low)
             high = torch.where(values >= reference, middle, high)
-            newton = middle - residual / slopes
+            newton = middle - newton_step
             valid_newton = (
                 torch.isfinite(newton)
                 & (slopes > epsilon)
