@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation.streamers import BaseStreamer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from expr07_tria import BatchedDiagonalSplineTransport
+from expr07_tria import BoostedWaveletSplineTransport
 
 
 MODEL_NAME = "HuggingFaceTB/SmolLM3-3B"
@@ -129,6 +129,18 @@ def candidate_score(
     return standardized(information_gain) - density_weight * standardized(log_density)
 
 
+def transport_log_prob(
+    transport: BoostedWaveletSplineTransport,
+    states: Tensor,
+) -> Tensor:
+    """Evaluate density under a transport to a standard Gaussian reference."""
+    reference = transport(states)
+    log_reference_density = -0.5 * (reference.square() + math.log(2.0 * math.pi)).sum(
+        dim=1
+    )
+    return log_reference_density + transport.log_abs_det_jacobian(states)
+
+
 def match_norm(samples: Tensor, target: Tensor) -> Tensor:
     target_norm = torch.linalg.vector_norm(target)
     sample_norms = torch.linalg.vector_norm(samples, dim=1, keepdim=True)
@@ -149,6 +161,11 @@ class Transport:
         noise_scale: float = 0.05,
         density_weight: float = 1.0,
         max_fit_iterations: int = 10,
+        max_wavelet_level: int = 6,
+        max_parent_distance: int = 256,
+        max_learners_per_component: int = 4,
+        candidate_count: int = 8,
+        block_size: int = 256,
         token_choice_callback: TokenChoiceCallback | None = None,
     ) -> None:
         elite_count = math.floor(sample_count * elite_fraction)
@@ -166,6 +183,16 @@ class Transport:
             raise ValueError("noise_scale must be positive")
         if density_weight < 0.0:
             raise ValueError("density_weight cannot be negative")
+        if max_wavelet_level < 0:
+            raise ValueError("max_wavelet_level cannot be negative")
+        if max_parent_distance < 1:
+            raise ValueError("max_parent_distance must be positive")
+        if max_learners_per_component < 0:
+            raise ValueError("max_learners_per_component cannot be negative")
+        if candidate_count < 1:
+            raise ValueError("candidate_count must be positive")
+        if block_size < 1:
+            raise ValueError("block_size must be positive")
 
         self.sample_count = sample_count
         self.iterations = iterations
@@ -173,6 +200,11 @@ class Transport:
         self.noise_scale = noise_scale
         self.density_weight = density_weight
         self.max_fit_iterations = max_fit_iterations
+        self.max_wavelet_level = max_wavelet_level
+        self.max_parent_distance = max_parent_distance
+        self.max_learners_per_component = max_learners_per_component
+        self.candidate_count = candidate_count
+        self.block_size = block_size
         self.token_choice_callback = token_choice_callback
         self.last_hidden_state: Tensor | None = None
         self.last_steered_hidden_state: Tensor | None = None
@@ -204,7 +236,7 @@ class Transport:
             * self.noise_scale
         )
         samples = match_norm(samples, state)
-        samples[0] = state
+        # samples[0] = state
         return samples
 
     def _steer_state(self, module: nn.Module, state: Tensor) -> Tensor:
@@ -215,15 +247,20 @@ class Transport:
         )
         original = state.to(fit_dtype)
         candidates = self._initial_samples(original)
-        transport = BatchedDiagonalSplineTransport(
-            max_fit_iterations=self.max_fit_iterations
+        transport = BoostedWaveletSplineTransport(
+            max_wavelet_level=self.max_wavelet_level,
+            max_parent_distance=self.max_parent_distance,
+            max_learners_per_component=self.max_learners_per_component,
+            candidate_count=self.candidate_count,
+            block_size=self.block_size,
+            max_fit_iterations=self.max_fit_iterations,
         )
 
         for _ in range(self.iterations):
             transport.fit(candidates)
             score = candidate_score(
                 self._information_gain(module, candidates),
-                transport.log_prob(candidates),
+                transport_log_prob(transport, candidates),
                 self.density_weight,
             )
             elite_indices = torch.topk(
@@ -240,7 +277,7 @@ class Transport:
         transport.fit(candidates)
         final_score = candidate_score(
             self._information_gain(module, candidates),
-            transport.log_prob(candidates),
+            transport_log_prob(transport, candidates),
             self.density_weight,
         )
         return candidates[torch.argmin(final_score)].to(state.dtype)
@@ -299,6 +336,11 @@ def main() -> None:
     parser.add_argument("--noise-scale", type=float, default=0.05)
     parser.add_argument("--density-weight", type=float, default=1.0)
     parser.add_argument("--fit-iterations", type=int, default=10)
+    parser.add_argument("--max-wavelet-level", type=int, default=6)
+    parser.add_argument("--max-parent-distance", type=int, default=256)
+    parser.add_argument("--max-learners-per-component", type=int, default=4)
+    parser.add_argument("--candidate-count", type=int, default=8)
+    parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--no-reasoning",
@@ -334,6 +376,11 @@ def main() -> None:
         noise_scale=args.noise_scale,
         density_weight=args.density_weight,
         max_fit_iterations=args.fit_iterations,
+        max_wavelet_level=args.max_wavelet_level,
+        max_parent_distance=args.max_parent_distance,
+        max_learners_per_component=args.max_learners_per_component,
+        candidate_count=args.candidate_count,
+        block_size=args.block_size,
         token_choice_callback=display.add_token_choices,
     )
     lm_head = model.get_output_embeddings()

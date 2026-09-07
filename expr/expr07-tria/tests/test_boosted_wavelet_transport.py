@@ -269,3 +269,45 @@ def test_leading_component_exceedance_sampling() -> None:
         pass
     else:
         raise AssertionError("later-component exceedance must be rejected")
+
+
+def test_inverse_retains_full_support_of_crossing_wavelets() -> None:
+    generator = torch.Generator().manual_seed(91)
+    x0 = torch.randn(128, generator=generator, dtype=torch.float64)
+    x1 = torch.randn(128, generator=generator, dtype=torch.float64)
+    samples = torch.stack(
+        (
+            x0,
+            x1,
+            x0
+            - x1
+            + 0.05
+            * torch.randn(128, generator=generator, dtype=torch.float64),
+            torch.randn(128, generator=generator, dtype=torch.float64),
+        ),
+        dim=1,
+    )
+    transport = BoostedWaveletSplineTransport(
+        max_parent_distance=1,
+        max_learners_per_component=2,
+        candidate_count=8,
+        learning_rate=1.0,
+        max_fit_iterations=10,
+    ).fit(samples)
+    reference = transport(samples)
+
+    assert transport.learner_starts_ is not None
+    assert transport.learner_widths_ is not None
+    assert transport.learner_outputs_ is not None
+    crossing = (
+        (transport.learner_starts_ == 0)
+        & (transport.learner_widths_ == 2)
+        & (transport.learner_outputs_ == 2)
+    )
+    assert torch.any(crossing)
+    assert torch.allclose(
+        transport.inverse(reference),
+        samples,
+        atol=1e-9,
+        rtol=1e-9,
+    )

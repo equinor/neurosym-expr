@@ -16,6 +16,7 @@ GenerationDisplay = MODULE.GenerationDisplay
 FinalOutputStreamer = MODULE.FinalOutputStreamer
 candidate_score = MODULE.candidate_score
 token_entropy = MODULE.token_entropy
+transport_log_prob = MODULE.transport_log_prob
 
 
 def test_candidate_score_prefers_low_entropy_and_high_density() -> None:
@@ -34,6 +35,29 @@ def test_token_entropy_is_lower_for_confident_logits() -> None:
     entropy = token_entropy(logits)
 
     assert entropy[0] < entropy[1]
+
+
+def test_transport_log_prob_uses_reference_and_jacobian() -> None:
+    class IdentityTransport:
+        @staticmethod
+        def __call__(states: torch.Tensor) -> torch.Tensor:
+            return states
+
+        @staticmethod
+        def log_abs_det_jacobian(states: torch.Tensor) -> torch.Tensor:
+            return states.new_tensor([0.5, -0.25])
+
+    states = torch.tensor([[0.0, 0.0], [1.0, -1.0]])
+
+    log_prob = transport_log_prob(IdentityTransport(), states)
+
+    expected = torch.tensor(
+        [
+            -torch.log(torch.tensor(2.0 * torch.pi)) + 0.5,
+            -1.0 - torch.log(torch.tensor(2.0 * torch.pi)) - 0.25,
+        ]
+    )
+    assert torch.allclose(log_prob, expected)
 
 
 def test_transport_hook_preserves_shape_and_last_state_norm() -> None:
@@ -72,6 +96,16 @@ def test_transport_hook_preserves_shape_and_last_state_norm() -> None:
     assert streamed_choices[0][0] == 1
     assert torch.equal(streamed_choices[0][1], original_token_ids)
     assert torch.equal(streamed_choices[0][2], transport_token_ids)
+
+
+def test_transport_uses_scalable_wavelet_defaults() -> None:
+    intervention = Transport()
+
+    assert intervention.max_wavelet_level == 6
+    assert intervention.max_parent_distance == 256
+    assert intervention.max_learners_per_component == 4
+    assert intervention.candidate_count == 8
+    assert intervention.block_size == 256
 
 
 def test_generation_display_streams_transport_diagnostics() -> None:

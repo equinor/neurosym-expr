@@ -472,33 +472,7 @@ class BoostedWaveletSplineTransport(nn.Module):
             dimension_count,
             self.max_wavelet_level,
         ).to(samples.device)
-        all_projections = project_haar(
-            standardized,
-            feature_set.starts,
-            feature_set.widths,
-        )
-        if self.max_learners_per_component > 0:
-            all_signals, all_norms, all_finite_variation = (
-                self._screening_data(all_projections)
-            )
-            spline_batches = [
-                self._prepare_candidate_splines(
-                    all_projections[
-                        :, start : start + self.fit_feature_batch_size
-                    ]
-                )
-                for start in range(
-                    0,
-                    all_projections.shape[1],
-                    self.fit_feature_batch_size,
-                )
-            ]
-            all_splines = self._combine_candidate_spline_data(spline_batches)
-        else:
-            all_signals = None
-            all_norms = None
-            all_finite_variation = None
-            all_splines = None
+        max_wavelet_width = int(feature_set.widths.max().item())
 
         learner_outputs: list[Tensor] = []
         learner_starts: list[Tensor] = []
@@ -514,19 +488,41 @@ class BoostedWaveletSplineTransport(nn.Module):
         for block_start in range(0, dimension_count, self.block_size):
             if self.max_learners_per_component == 0:
                 break
-            assert (
-                all_signals is not None
-                and all_norms is not None
-                and all_finite_variation is not None
-                and all_splines is not None
-            )
             block_end = min(block_start + self.block_size, dimension_count)
             admissible = self._admissible_features(feature_set, block_start)
             if admissible.numel() == 0:
                 continue
-            signals = all_signals[:, admissible]
-            norms = all_norms[admissible]
-            finite_variation = all_finite_variation[admissible]
+            admissible_starts = feature_set.starts[admissible]
+            history_start = 0
+            if self.max_parent_distance is not None:
+                history_start = max(
+                    0,
+                    block_start
+                    - self.max_parent_distance
+                    - max_wavelet_width
+                    + 1,
+                )
+            projections = project_haar(
+                standardized[:, history_start:block_start],
+                admissible_starts - history_start,
+                feature_set.widths[admissible],
+            )
+            signals, norms, finite_variation = self._screening_data(projections)
+            spline_batches = [
+                self._prepare_candidate_splines(
+                    projections[:, start : start + self.fit_feature_batch_size]
+                )
+                for start in range(
+                    0,
+                    projections.shape[1],
+                    self.fit_feature_batch_size,
+                )
+            ]
+            block_splines = (
+                spline_batches[0]
+                if len(spline_batches) == 1
+                else self._combine_candidate_spline_data(spline_batches)
+            )
             residual = outputs[:, block_start:block_end]
             component_count = block_end - block_start
             component_ids = torch.arange(
@@ -554,8 +550,7 @@ class BoostedWaveletSplineTransport(nn.Module):
                     selected_count,
                     dim=1,
                 )
-                candidates = admissible[screened.indices]
-                flat_candidates = candidates.flatten()
+                flat_candidates = screened.indices.flatten()
                 candidate_residuals = (
                     residual.T.repeat_interleave(selected_count, dim=0)
                 )
@@ -570,7 +565,7 @@ class BoostedWaveletSplineTransport(nn.Module):
                     right_derivatives,
                 ) = self._fit_candidate_splines(
                     self._index_candidate_spline_data(
-                        all_splines,
+                        block_splines,
                         flat_candidates,
                     ),
                     candidate_residuals,
@@ -599,7 +594,7 @@ class BoostedWaveletSplineTransport(nn.Module):
                 ).T
 
                 accepted_indices = best_flat[accepted]
-                features = flat_candidates[accepted_indices]
+                features = admissible[flat_candidates[accepted_indices]]
                 learner_outputs.append(component_ids[accepted])
                 learner_starts.append(feature_set.starts[features])
                 learner_widths.append(feature_set.widths[features])
@@ -1010,6 +1005,31 @@ class BoostedWaveletSplineTransport(nn.Module):
             values,
         )
 
+    def _required_history_start(self, component_start: int) -> int:
+        """Return a bounded window containing every admissible parent."""
+        assert self.n_features_in_ is not None
+        if component_start >= self.n_features_in_:
+            return component_start
+        if self.max_parent_distance is None:
+            return 0
+        dependency_boundary = (
+            component_start // self.block_size
+        ) * self.block_size
+        available_level = int(math.log2(self.n_features_in_))
+        final_level = (
+            available_level
+            if self.max_wavelet_level is None
+            else min(self.max_wavelet_level, available_level)
+        )
+        max_wavelet_width = 1 << final_level
+        return max(
+            0,
+            dependency_boundary
+            - self.max_parent_distance
+            - max_wavelet_width
+            + 1,
+        )
+
     def _inverse_from_prefix(self, X_star: Tensor, Z: Tensor) -> Tensor:
         assert (
             self.n_features_in_ is not None
@@ -1023,16 +1043,8 @@ class BoostedWaveletSplineTransport(nn.Module):
         result_blocks = [standardized_prefix]
         history = standardized_prefix
         component_start = prefix_count
-        dependency_boundary = (
-            component_start // self.block_size
-        ) * self.block_size
-        history_start = 0
-        if self.max_parent_distance is not None:
-            history_start = max(
-                0,
-                dependency_boundary - self.max_parent_distance,
-            )
-            history = history[:, history_start:]
+        history_start = self._required_history_start(component_start)
+        history = history[:, history_start:]
 
         while component_start < self.n_features_in_:
             dependency_boundary = (
@@ -1060,15 +1072,11 @@ class BoostedWaveletSplineTransport(nn.Module):
             result_blocks.append(block)
             history = torch.cat((history, block), dim=1)
             component_start = component_end
-            if self.max_parent_distance is not None:
-                retained_start = max(
-                    0,
-                    component_end - self.max_parent_distance,
-                )
-                drop = retained_start - history_start
-                if drop > 0:
-                    history = history[:, drop:]
-                    history_start = retained_start
+            retained_start = self._required_history_start(component_start)
+            drop = retained_start - history_start
+            if drop > 0:
+                history = history[:, drop:]
+                history_start = retained_start
 
         standardized = torch.cat(result_blocks, dim=1)
         return (

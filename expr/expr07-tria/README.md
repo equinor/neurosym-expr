@@ -82,7 +82,10 @@ exceedances = transport.sample_exceedance(
 For large GPU workloads, `block_size` groups mapped components that share the
 same preceding parent variables. Fitting and inversion are vectorized within
 each block, so 12,000 components with `block_size=256` require only about 47
-sequential inverse stages. The default `block_size=1` preserves scalar
+sequential inverse stages. During fitting, screening signals and spline
+designs are built one parent window at a time and released after each block;
+keep `max_parent_distance` finite to make the peak working memory independent
+of the total component count. The default `block_size=1` preserves scalar
 triangular behavior. Wavelet supports are always restricted to preceding
 blocks, which preserves exact inversion. Exact exceedance sampling currently
 supports the leading component; later-component inequalities require
@@ -109,9 +112,9 @@ available through `coefficients_`, `effective_dof_`, `aicc_`, and `nll_`.
 
 `smollm3_hidden_steering.py` captures the last-token hidden state immediately
 before `lm_head` computes the next-token logits. It samples a local cloud,
-fits a diagonal spline transport, and repeatedly refits it to states that
-combine low next-token entropy with high fitted density. Candidate norms are
-matched to the original hidden state before evaluation.
+fits a boosted causal Haar-wavelet spline transport, and repeatedly refits it
+to states that combine low next-token entropy with high fitted density.
+Candidate norms are matched to the original hidden state before evaluation.
 
 ```bash
 uv run python smollm3_hidden_steering.py \
@@ -121,11 +124,43 @@ uv run python smollm3_hidden_steering.py \
   --elite-fraction 0.25 \
   --noise-scale 0.05 \
   --density-weight 1.0 \
+  --max-wavelet-level 6 \
+  --max-parent-distance 256 \
+  --block-size 256 \
   --seed 7
 ```
+
+These wavelet and block settings are the defaults and keep transport fitting
+bounded to a local parent window. Increase `--block-size` for faster inversion
+at the cost of excluding dependencies between coordinates in the same block.
 
 `Transport.last_hidden_state` contains the unmodified state, while
 `last_steered_hidden_state` contains the selected vector passed to `lm_head`.
 For each generation step, the script writes the original greedy token and the
 token selected after transport, including their IDs and decoded text, to
 standard error.
+
+## SmolLM3 particle sampling
+
+`smollm3_particle_sampling.py` keeps a population of model-generated token
+trajectories instead of perturbing hidden states. With the default entropy
+weight, temperature, and top-p settings, it reduces to ancestral sampling from
+SmolLM3. Temperature and top-p can define a different proposal; sequential
+importance weights correct for that proposal, and low-effective-sample-size
+populations are resampled.
+
+```bash
+uv run python smollm3_particle_sampling.py \
+  "Explain why the sky is blue." \
+  --particles 32 \
+  --entropy-weight 0.05 \
+  --resample-threshold 0.5 \
+  --seed 7
+```
+
+A positive entropy weight targets trajectories proportional to the model
+sequence probability times `exp(-weight * cumulative_entropy)`. This favors
+prefixes where the model remains confident while ensuring that every particle
+is reached through ordinary token generation. `--best` returns the
+highest-scoring surviving trajectory instead of sampling from the final
+particle population.
