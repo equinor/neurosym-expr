@@ -1,5 +1,29 @@
 # -*- mode: org -*-
 
+[2026-09-07 Mon]
+
+[15:40]
+
+I can find the regions of the weights of the model that relate to the
+input by finding the "local subspace" given the input.
+
+We can project the embedding of the input into the output space.
+
+Isolate the local weights by calculating the dot product between the
+lm_head.weights and keep the top rows. This forms the immediate
+neighborhood.
+
+We can use a unsupervised clustering algorithm or something like
+k-means to find the local weights. (our favourite: umap?)
+
+If we predict the next token given each region, we can use it to train
+a transport.
+
+If we calculate the inversion we could potentially be able to say how
+our parameters for weighting each region for the steering of our tokens?
+
+
+
 [2026-09-01 Tue]
 
 [14:06]
