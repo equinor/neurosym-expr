@@ -217,7 +217,7 @@ def test_independent_gaussian_data_rejects_soft_stage() -> None:
     ).fit(samples)
 
     assert transport.stage_count_ == 0
-    assert transport.stopping_reason_ == "no_global_criterion_improvement"
+    assert transport.stopping_reason_ == "candidate_stage_is_identity"
 
 
 def test_parent_window_restricts_tree_features() -> None:
@@ -235,6 +235,29 @@ def test_parent_window_restricts_tree_features() -> None:
     component = int(stage.component_indices_[0].item())
     assert torch.all(tree.feature_starts_ >= component - 1)
     assert torch.all(tree.feature_starts_ + tree.feature_widths_ <= component)
+
+
+def test_sparse_active_set_learns_conditional_components() -> None:
+    values = multi_component_samples()
+    transport = BoostedSoftTreeTransport(
+        max_stages=1,
+        max_depth=1,
+        num_bins=6,
+        max_epochs=60,
+        patience=15,
+        validation_fraction=0.0,
+    ).fit(values)
+
+    assert transport.stage_count_ == 1
+    stage = transport.stages[0]
+    assert stage._component_indices == (1, 2)
+    assert torch.all(
+        stage.feature_starts_
+        < stage.component_indices_.unsqueeze(1)
+    )
+    reference, logdet = transport.forward_with_logdet(values)
+    assert torch.all(torch.isfinite(logdet))
+    assert torch.allclose(transport.inverse(reference), values, atol=1e-9, rtol=1e-9)
 
 
 def test_stage_batches_multiple_components() -> None:

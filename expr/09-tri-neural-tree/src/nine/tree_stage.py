@@ -187,6 +187,15 @@ class HardTreeTransportStage(nn.Module):
                 _SCREEN_ELEMENT_BUDGET
                 // (sample_count * _SCREEN_FEATURE_COUNT),
             ),
+            max(
+                1,
+                _SCREEN_ELEMENT_BUDGET
+                // min(
+                    dimension_count,
+                    (self.max_parent_distance or dimension_count)
+                    + _SCREEN_COMPONENT_BATCH_SIZE,
+                ),
+            ),
         )
 
         for start in range(1, dimension_count, component_batch_size):

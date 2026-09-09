@@ -63,6 +63,20 @@ transport = BoostedSoftTreeTransport(
 ).fit(samples)
 ```
 
+Fitting uses one sparse active-set strategy at every dimensionality. Each
+boosting stage streams over causal parent/component pairs in bounded blocks,
+screens both location and scale dependence, and trains only statistically
+viable components with their strongest parents. Accepted stages transform the
+samples before the next screen, allowing later stages to discover residual
+dependencies. This avoids a dense dependency mask and adapts the number and
+identity of parents independently for each component.
+
+The selected singleton projections avoid full-dimensional Haar prefix sums
+during fitting, forward evaluation, and sequential inversion.
+The search horizon defaults to the preceding 256 coordinates, making screening
+linear in the ambient dimension for ordered manifolds. `max_parent_distance`
+can be adjusted when the known dependence scale is shorter or longer.
+
 Candidate components share one batched optimizer loop, with selected Haar
 projections cached throughout fitting. Components are retained only when they
 improve their validation objective. Candidate stages are then retained only

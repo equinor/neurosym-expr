@@ -229,19 +229,20 @@ class SoftTreeRationalQuadraticSpline(nn.Module):
                 candidate_widths,
                 torch.zeros_like(candidate_starts),
             )
-        projections = (
-            project_haar(
-                conditioning,
-                features.starts,
-                features.widths,
-            )
-            if projection_prefix is None
-            else _project_haar_from_prefix(
+        if torch.all(features.widths == 1):
+            projections = conditioning[:, features.starts]
+        elif projection_prefix is not None:
+            projections = _project_haar_from_prefix(
                 projection_prefix,
                 features.starts,
                 features.widths,
             )
-        )
+        else:
+            projections = project_haar(
+                conditioning,
+                features.starts,
+                features.widths,
+            )
         return features, projections
 
     def _initialize_topology(

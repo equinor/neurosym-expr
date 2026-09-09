@@ -11,7 +11,7 @@ from nine.soft_tree import (
     _fit_soft_tree_batch,
     _transform_from_parameters,
 )
-from nine.tree_stage import HardTreeTransportStage, _DENSE_COMPONENT_LIMIT
+from nine.tree_stage import HardTreeTransportStage
 from nine.wavelet_features import (
     _batched_project_haar_from_prefix,
     _haar_prefix,
@@ -26,6 +26,7 @@ _PARAMETER_NAMES = (
     "leaf_height_logits",
     "leaf_derivative_logits",
 )
+_FIT_ELEMENT_BUDGET = 1_000_000
 
 
 class _SoftTreeComponentView:
@@ -162,7 +163,7 @@ class SoftTreeTransportStage(nn.Module):
         patience: int = 30,
         min_temperature: float = 0.05,
         validation_fraction: float = 0.2,
-        max_parent_distance: int | None = None,
+        max_parent_distance: int | None = 256,
     ) -> None:
         super().__init__()
         if max_parent_distance is not None and max_parent_distance < 1:
@@ -211,6 +212,7 @@ class SoftTreeTransportStage(nn.Module):
         self.training_nll_: float | None = None
         self.stopping_reason_: str | None = None
         self._placement_requested = False
+        self._singleton_features = True
 
     def _apply(self, fn: Any, recurse: bool = True) -> SoftTreeTransportStage:
         result = super()._apply(fn, recurse=recurse)
@@ -416,6 +418,7 @@ class SoftTreeTransportStage(nn.Module):
             error_msgs,
         )
         self._component_indices = tuple(self.component_indices_.tolist())
+        self._singleton_features = bool(torch.all(self.feature_widths_ == 1))
         if any(
             left >= right
             for left, right in zip(
@@ -470,6 +473,7 @@ class SoftTreeTransportStage(nn.Module):
         self._component_indices = ()
         self.component_training_nll_ = []
         self.component_validation_nll_ = []
+        self._singleton_features = True
 
     def _install_components(
         self,
@@ -512,6 +516,7 @@ class SoftTreeTransportStage(nn.Module):
         self.component_validation_nll_ = [
             tree.validation_nll_ for tree in accepted
         ]
+        self._singleton_features = bool(torch.all(self.feature_widths_ == 1))
 
     def _candidate_features(
         self,
@@ -556,17 +561,11 @@ class SoftTreeTransportStage(nn.Module):
         ) / self.conditioning_scale_
         self._clear_components(samples)
 
-        if samples.shape[1] <= _DENSE_COMPONENT_LIMIT:
-            candidates: list[tuple[int, Tensor | None]] = [
-                (component, None)
-                for component in range(1, samples.shape[1])
-            ]
-        else:
-            screener = HardTreeTransportStage(
-                max_wavelet_level=self.max_wavelet_level,
-                max_parent_distance=self.max_parent_distance,
-            )
-            candidates = screener._screen_components(standardized)
+        screener = HardTreeTransportStage(
+            max_wavelet_level=self.max_wavelet_level,
+            max_parent_distance=self.max_parent_distance,
+        )
+        candidates = screener._screen_components(standardized)
 
         candidate_trees: list[SoftTreeRationalQuadraticSpline] = []
         candidate_indices: list[int] = []
@@ -595,14 +594,36 @@ class SoftTreeTransportStage(nn.Module):
             candidate_starts.append(starts)
             candidate_widths.append(widths)
 
-        _fit_soft_tree_batch(
-            candidate_trees,
-            candidate_conditioning,
-            candidate_targets,
-            candidate_starts,
-            candidate_widths,
-            projection_prefix=_haar_prefix(standardized),
+        per_component_elements = samples.shape[0] * max(
+            (1 << self.max_depth) * self.num_bins,
+            1,
         )
+        fit_batch_size = max(1, _FIT_ELEMENT_BUDGET // per_component_elements)
+        all_singletons = all(widths is not None for widths in candidate_widths)
+        if all_singletons and candidate_widths:
+            all_singletons = bool(
+                torch.all(
+                    torch.cat(
+                        [
+                            widths
+                            for widths in candidate_widths
+                            if widths is not None
+                        ]
+                    )
+                    == 1
+                )
+            )
+        projection_prefix = None if all_singletons else _haar_prefix(standardized)
+        for start in range(0, len(candidate_trees), fit_batch_size):
+            stop = start + fit_batch_size
+            _fit_soft_tree_batch(
+                candidate_trees[start:stop],
+                candidate_conditioning[start:stop],
+                candidate_targets[start:stop],
+                candidate_starts[start:stop],
+                candidate_widths[start:stop],
+                projection_prefix=projection_prefix,
+            )
 
         self._install_components(candidate_trees, candidate_indices)
         with torch.no_grad():
@@ -654,13 +675,17 @@ class SoftTreeTransportStage(nn.Module):
                 values.new_zeros((values.shape[0], 0)) if compute_logdet else None,
             )
 
-        projection_prefix = _haar_prefix(standardized)
         component_slice = slice(0, component_count)
-        projections = _batched_project_haar_from_prefix(
-            projection_prefix,
-            self.feature_starts_[component_slice],
-            self.feature_widths_[component_slice],
-        )
+        starts = self.feature_starts_[component_slice]
+        widths = self.feature_widths_[component_slice]
+        if self._singleton_features:
+            projections = standardized[:, starts]
+        else:
+            projections = _batched_project_haar_from_prefix(
+                _haar_prefix(standardized),
+                starts,
+                widths,
+            )
         parameters = [
             getattr(self, name)[component_slice]
             for name in _PARAMETER_NAMES
@@ -726,26 +751,37 @@ class SoftTreeTransportStage(nn.Module):
         prefix_size: int,
     ) -> Tensor:
         reconstructed = reference.clone()
-        projection_prefix = reference.new_zeros(
-            (reference.shape[0], reference.shape[1] + 1)
+        projection_prefix = (
+            None
+            if self._singleton_features
+            else reference.new_zeros(
+                (reference.shape[0], reference.shape[1] + 1)
+            )
         )
         projected_dimension = 0
         for index, component in enumerate(self._component_indices):
             if component < prefix_size:
                 continue
-            standardized = (
-                reconstructed[:, projected_dimension:component]
-                - self.conditioning_mean_[projected_dimension:component]
-            ) / self.conditioning_scale_[projected_dimension:component]
-            projection_prefix[:, projected_dimension + 1 : component + 1] = (
-                projection_prefix[:, projected_dimension : projected_dimension + 1]
-                + standardized.cumsum(dim=1)
-            )
-            projections = _project_haar_from_prefix(
-                projection_prefix,
-                self.feature_starts_[index],
-                self.feature_widths_[index],
-            )
+            if self._singleton_features:
+                starts = self.feature_starts_[index]
+                projections = (
+                    reconstructed[:, starts] - self.conditioning_mean_[starts]
+                ) / self.conditioning_scale_[starts]
+            else:
+                assert projection_prefix is not None
+                standardized = (
+                    reconstructed[:, projected_dimension:component]
+                    - self.conditioning_mean_[projected_dimension:component]
+                ) / self.conditioning_scale_[projected_dimension:component]
+                projection_prefix[:, projected_dimension + 1 : component + 1] = (
+                    projection_prefix[:, projected_dimension : projected_dimension + 1]
+                    + standardized.cumsum(dim=1)
+                )
+                projections = _project_haar_from_prefix(
+                    projection_prefix,
+                    self.feature_starts_[index],
+                    self.feature_widths_[index],
+                )
             reconstructed[:, component : component + 1] = (
                 _transform_from_parameters(
                     projections,

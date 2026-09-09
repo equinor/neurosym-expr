@@ -26,7 +26,7 @@ class BoostedSoftTreeTransport(nn.Module):
         patience: int = 30,
         min_temperature: float = 0.05,
         validation_fraction: float = 0.2,
-        max_parent_distance: int | None = None,
+        max_parent_distance: int | None = 256,
         max_fit_iterations: int = 10,
         minimum_improvement_per_sample: float = 0.1,
         fine_tune_epochs: int = 25,
@@ -251,6 +251,7 @@ class BoostedSoftTreeTransport(nn.Module):
                 )
             else:
                 validation_improvement = improvement
+                candidate_validation_nll = candidate_nll
             tolerance = 100.0 * torch.finfo(values.dtype).eps * (
                 1.0 + abs(current_validation_nll)
             )
