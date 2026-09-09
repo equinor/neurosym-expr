@@ -1,0 +1,1123 @@
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+_DEGREE = 3
+_DEFAULT_FIT_ITERATIONS = 10
+_INVERSE_ITERATIONS = 60
+_FIT_DIMENSION_BATCH_SIZE = 16_384
+
+
+@dataclass
+class _FitBatch:
+    knots: Tensor
+    raw_coefficients: Tensor
+    polynomial_coefficients: Tensor
+    effective_dof: Tensor
+    aicc: Tensor
+    nll: Tensor
+    left_values: Tensor
+    right_values: Tensor
+    left_derivatives: Tensor
+    right_derivatives: Tensor
+    log_smoothing: Tensor
+
+
+def _bounded_basis(x: Tensor, knots: Tensor) -> tuple[Tensor, Tensor]:
+    """Evaluate cubic B-spline bases and their derivatives."""
+    knot_count = knots.shape[1]
+    basis_count = knot_count - _DEGREE - 1
+    values = (
+        (x.unsqueeze(-1) >= knots[:, :-1].unsqueeze(0))
+        & (x.unsqueeze(-1) < knots[:, 1:].unsqueeze(0))
+    ).to(x.dtype)
+
+    at_right = x >= knots[:, basis_count].unsqueeze(0)
+    values[..., -1] = torch.where(at_right, torch.ones_like(x), values[..., -1])
+
+    lower_values: Tensor | None = None
+    for level in range(1, _DEGREE + 1):
+        size = knot_count - level - 1
+        left_denominator = (knots[:, level : level + size] - knots[:, :size]).unsqueeze(
+            0
+        )
+        right_denominator = (
+            knots[:, level + 1 : level + 1 + size] - knots[:, 1 : 1 + size]
+        ).unsqueeze(0)
+
+        safe_left = torch.where(
+            left_denominator != 0,
+            left_denominator,
+            torch.ones_like(left_denominator),
+        )
+        safe_right = torch.where(
+            right_denominator != 0,
+            right_denominator,
+            torch.ones_like(right_denominator),
+        )
+        left = torch.where(
+            left_denominator != 0,
+            (x.unsqueeze(-1) - knots[:, :size].unsqueeze(0))
+            / safe_left
+            * values[..., :size],
+            torch.zeros_like(values[..., :size]),
+        )
+        right = torch.where(
+            right_denominator != 0,
+            (knots[:, level + 1 : level + 1 + size].unsqueeze(0) - x.unsqueeze(-1))
+            / safe_right
+            * values[..., 1 : size + 1],
+            torch.zeros_like(values[..., :size]),
+        )
+        values = left + right
+        if level == _DEGREE - 1:
+            lower_values = values
+
+    assert lower_values is not None
+    left_denominator = (
+        knots[:, _DEGREE : _DEGREE + basis_count] - knots[:, :basis_count]
+    )
+    right_denominator = (
+        knots[:, _DEGREE + 1 : _DEGREE + 1 + basis_count]
+        - knots[:, 1 : 1 + basis_count]
+    )
+    left_scale = torch.where(
+        left_denominator != 0,
+        _DEGREE / left_denominator,
+        torch.zeros_like(left_denominator),
+    )
+    right_scale = torch.where(
+        right_denominator != 0,
+        _DEGREE / right_denominator,
+        torch.zeros_like(right_denominator),
+    )
+    derivatives = (
+        left_scale.unsqueeze(0) * lower_values[..., :basis_count]
+        - right_scale.unsqueeze(0) * lower_values[..., 1 : basis_count + 1]
+    )
+
+    right_values = torch.zeros_like(values)
+    right_values[..., -1] = 1.0
+    right_derivatives = torch.zeros_like(derivatives)
+    final_slope = _DEGREE / (knots[:, basis_count] - knots[:, basis_count - 1])
+    right_derivatives[..., -2] = -final_slope.unsqueeze(0)
+    right_derivatives[..., -1] = final_slope.unsqueeze(0)
+    values = torch.where(at_right.unsqueeze(-1), right_values, values)
+    derivatives = torch.where(
+        at_right.unsqueeze(-1),
+        right_derivatives,
+        derivatives,
+    )
+    return values, derivatives
+
+
+def _bounded_basis_evaluate(
+    x: Tensor,
+    knots: Tensor,
+    coefficients: Tensor,
+    *,
+    with_derivatives: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    """Evaluate only the four non-zero cubic basis functions."""
+    basis_count = knots.shape[1] - _DEGREE - 1
+    left = knots[:, _DEGREE]
+    right = knots[:, basis_count]
+    interval_count = basis_count - _DEGREE
+    spans = (
+        torch.floor((x - left) / (right - left) * interval_count).to(torch.long)
+        + _DEGREE
+    ).clamp(min=_DEGREE, max=basis_count - 1)
+
+    levels = torch.arange(1, _DEGREE + 1, device=x.device)
+    dimensions = torch.arange(knots.shape[0], device=x.device)[None, :, None]
+    left_distances = (
+        x.unsqueeze(2)
+        - knots[
+            dimensions,
+            spans.unsqueeze(2) + 1 - levels,
+        ]
+    )
+    right_distances = knots[dimensions, spans.unsqueeze(2) + levels] - x.unsqueeze(2)
+
+    local_basis = torch.ones_like(x).unsqueeze(2)
+    lower_basis: Tensor | None = None
+    for level in range(1, _DEGREE + 1):
+        saved = torch.zeros_like(x)
+        next_basis = []
+        for index in range(level):
+            denominator = (
+                right_distances[..., index] + left_distances[..., level - index - 1]
+            )
+            ratio = torch.where(
+                denominator != 0,
+                local_basis[..., index] / denominator,
+                torch.zeros_like(denominator),
+            )
+            next_basis.append(saved + right_distances[..., index] * ratio)
+            saved = left_distances[..., level - index - 1] * ratio
+        next_basis.append(saved)
+        local_basis = torch.stack(next_basis, dim=2)
+        if level == _DEGREE - 1:
+            lower_basis = local_basis
+
+    assert lower_basis is not None
+    offsets = torch.arange(-_DEGREE, 1, device=x.device)
+    knot_indices = spans.unsqueeze(2) + offsets
+    local_coefficients = coefficients[dimensions, knot_indices]
+    values = torch.sum(local_basis * local_coefficients, dim=2)
+    if not with_derivatives:
+        return values, None
+
+    alpha_denominator = (
+        knots[dimensions, knot_indices + _DEGREE] - knots[dimensions, knot_indices]
+    )
+    beta_denominator = (
+        knots[dimensions, knot_indices + _DEGREE + 1]
+        - knots[dimensions, knot_indices + 1]
+    )
+    alpha = torch.where(
+        alpha_denominator != 0,
+        _DEGREE / alpha_denominator,
+        torch.zeros_like(alpha_denominator),
+    )
+    beta = torch.where(
+        beta_denominator != 0,
+        _DEGREE / beta_denominator,
+        torch.zeros_like(beta_denominator),
+    )
+    local_derivatives = alpha * F.pad(lower_basis, (1, 0)) - beta * F.pad(
+        lower_basis, (0, 1)
+    )
+    derivatives = torch.sum(local_derivatives * local_coefficients, dim=2)
+    return values, derivatives
+
+
+def _polynomial_coefficients(knots: Tensor, coefficients: Tensor) -> Tensor:
+    """Convert each uniform spline interval to a cubic in local coordinates."""
+    basis_count = knots.shape[1] - _DEGREE - 1
+    interval_count = basis_count - _DEGREE
+    edges = knots[:, _DEGREE : basis_count + 1]
+    nodes = knots.new_tensor((0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0))
+    points = edges[:, :-1].unsqueeze(0) + nodes[:, None, None] * (
+        edges[:, 1:] - edges[:, :-1]
+    ).unsqueeze(0)
+    values, _ = _bounded_basis_evaluate(
+        points.permute(2, 0, 1).reshape(-1, knots.shape[0]),
+        knots,
+        coefficients,
+        with_derivatives=False,
+    )
+    values = values.reshape(interval_count, nodes.numel(), -1).permute(2, 0, 1)
+    value_to_power = knots.new_tensor(
+        (
+            (1.0, 0.0, 0.0, 0.0),
+            (-5.5, 9.0, -4.5, 1.0),
+            (9.0, -22.5, 18.0, -4.5),
+            (-4.5, 13.5, -13.5, 4.5),
+        )
+    )
+    return values @ value_to_power.T
+
+
+def _polynomial_evaluate(
+    x: Tensor,
+    knots: Tensor,
+    polynomial_coefficients: Tensor,
+    interval_offsets: Tensor,
+    *,
+    with_derivatives: bool = True,
+) -> tuple[Tensor, Tensor | None]:
+    """Evaluate cached interval polynomials without constructing spline bases."""
+    interval_count = polynomial_coefficients.shape[1]
+    left = knots[:, _DEGREE]
+    right = knots[:, -_DEGREE - 1]
+    scaled = (x - left) / (right - left) * interval_count
+    intervals = (
+        torch.floor(scaled)
+        .to(torch.long)
+        .clamp(
+            min=0,
+            max=interval_count - 1,
+        )
+    )
+    local_x = scaled - intervals
+    local_coefficients = F.embedding(
+        intervals + interval_offsets,
+        polynomial_coefficients.flatten(0, 1),
+    )
+    values = (
+        (local_coefficients[..., 3] * local_x + local_coefficients[..., 2]) * local_x
+        + local_coefficients[..., 1]
+    ) * local_x + local_coefficients[..., 0]
+    if not with_derivatives:
+        return values, None
+
+    derivatives = (
+        (3.0 * local_coefficients[..., 3] * local_x + 2.0 * local_coefficients[..., 2])
+        * local_x
+        + local_coefficients[..., 1]
+    ) * (interval_count / (right - left))
+    return values, derivatives
+
+
+def _positive_increments(raw_increments: Tensor) -> Tensor:
+    return torch.cat(
+        (
+            raw_increments[:, :1],
+            F.softplus(raw_increments[:, 1:]),
+        ),
+        dim=1,
+    )
+
+
+def _coefficients(raw_increments: Tensor) -> Tensor:
+    return torch.cumsum(_positive_increments(raw_increments), dim=1)
+
+
+def _smoothing_matrix(size: int, reference: Tensor) -> Tensor:
+    identity = torch.eye(size, dtype=reference.dtype, device=reference.device)
+    differences = torch.diff(identity, n=2, dim=1)
+    return differences @ differences.T
+
+
+def _objective_derivatives(
+    raw_increments: Tensor,
+    quadratic: Tensor,
+    derivative_basis: Tensor,
+    sample_count: int,
+) -> tuple[Tensor, Tensor]:
+    increments = _positive_increments(raw_increments)
+    derivative = torch.bmm(
+        derivative_basis,
+        increments.unsqueeze(2),
+    ).squeeze(2)
+    reciprocal = derivative.reciprocal()
+    increment_gradient = (
+        torch.bmm(quadratic, increments.unsqueeze(2)).squeeze(2)
+        - torch.bmm(
+            derivative_basis.transpose(1, 2),
+            reciprocal.unsqueeze(2),
+        ).squeeze(2)
+        / sample_count
+    )
+
+    increment_hessian = torch.baddbmm(
+        quadratic,
+        derivative_basis.transpose(1, 2),
+        derivative_basis * (reciprocal.square() / sample_count).unsqueeze(2),
+    )
+
+    sigmoid = torch.sigmoid(raw_increments[:, 1:])
+    slopes = torch.cat(
+        (torch.ones_like(raw_increments[:, :1]), sigmoid),
+        dim=1,
+    )
+    curvatures = torch.cat(
+        (
+            torch.zeros_like(raw_increments[:, :1]),
+            sigmoid * (1.0 - sigmoid),
+        ),
+        dim=1,
+    )
+    hessian = increment_hessian * slopes.unsqueeze(1) * slopes.unsqueeze(
+        2
+    ) + torch.diag_embed(curvatures * increment_gradient)
+    return slopes * increment_gradient, hessian
+
+
+def _objective(
+    raw_increments: Tensor,
+    quadratic: Tensor,
+    derivative_basis: Tensor,
+    sample_count: int,
+) -> Tensor:
+    increments = _positive_increments(raw_increments)
+    derivative = torch.bmm(
+        derivative_basis,
+        increments.unsqueeze(2),
+    ).squeeze(2)
+    quadratic_increments = torch.bmm(
+        quadratic,
+        increments.unsqueeze(2),
+    ).squeeze(2)
+    return (
+        0.5 * torch.sum(increments * quadratic_increments, dim=1)
+        - torch.log(derivative).sum(dim=1) / sample_count
+    )
+
+
+def _fit_batch(
+    samples: Tensor,
+    mean: Tensor,
+    scale: Tensor,
+    max_iterations: int,
+    log_smoothing: float,
+) -> _FitBatch:
+    sample_count, dimension_count = samples.shape
+    standardized = (samples - mean) / scale
+    inner_knot_count = max(
+        1,
+        math.ceil(sample_count ** (1.0 / 3.0)),
+    )
+    quantiles = torch.quantile(
+        standardized,
+        standardized.new_tensor((0.1, 0.9)),
+        dim=0,
+    )
+    first, last = quantiles.unbind(dim=0)
+    if torch.any(first >= last):
+        raise ValueError("every input dimension must have varying quantiles")
+
+    positions = torch.linspace(
+        0.0,
+        1.0,
+        inner_knot_count + 2,
+        dtype=samples.dtype,
+        device=samples.device,
+    ).unsqueeze(1)
+    real_knots = first.unsqueeze(0) + (last - first).unsqueeze(0) * positions
+    knots = torch.cat(
+        (
+            real_knots[:1].repeat(_DEGREE, 1),
+            real_knots,
+            real_knots[-1:].repeat(_DEGREE, 1),
+        ),
+        dim=0,
+    ).T.contiguous()
+
+    left = knots[:, _DEGREE]
+    right = knots[:, -_DEGREE - 1]
+    bounded = torch.maximum(
+        torch.minimum(standardized, right.unsqueeze(0)),
+        left.unsqueeze(0),
+    )
+    design, derivative_basis = _bounded_basis(bounded, knots)
+    left_design, left_derivative_design = _bounded_basis(
+        left.unsqueeze(0),
+        knots,
+    )
+    right_design, right_derivative_design = _bounded_basis(
+        right.unsqueeze(0),
+        knots,
+    )
+    below = standardized < left.unsqueeze(0)
+    above = standardized > right.unsqueeze(0)
+    design = torch.where(
+        below.unsqueeze(2),
+        left_design
+        + (standardized - left.unsqueeze(0)).unsqueeze(2)
+        * left_derivative_design,
+        design,
+    )
+    design = torch.where(
+        above.unsqueeze(2),
+        right_design
+        + (standardized - right.unsqueeze(0)).unsqueeze(2)
+        * right_derivative_design,
+        design,
+    )
+    derivative_basis = torch.where(
+        below.unsqueeze(2),
+        left_derivative_design,
+        derivative_basis,
+    )
+    derivative_basis = torch.where(
+        above.unsqueeze(2),
+        right_derivative_design,
+        derivative_basis,
+    )
+    basis_count = design.shape[2]
+    design_by_dimension = design.permute(1, 0, 2).contiguous()
+    derivative_by_dimension = derivative_basis.permute(1, 0, 2).contiguous()
+    del standardized, bounded
+    gram = torch.bmm(
+        design_by_dimension.transpose(1, 2),
+        design_by_dimension,
+    )
+    penalty = _smoothing_matrix(basis_count, design)
+    del design
+    scales = torch.sqrt(design_by_dimension.square().sum(dim=(1, 2)) / sample_count)
+    smoothing = (math.exp(log_smoothing) * scales.square()).unsqueeze(1).unsqueeze(
+        2
+    ) * penalty.unsqueeze(0)
+    cumulative_derivative_basis = derivative_by_dimension.flip(2).cumsum(2).flip(2)
+    del derivative_basis
+    transformed_gram = gram.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+    transformed_smoothing = smoothing.flip((1, 2)).cumsum(1).cumsum(2).flip((1, 2))
+    quadratic = (transformed_gram + transformed_smoothing) / sample_count
+    identity = torch.eye(
+        basis_count,
+        dtype=samples.dtype,
+        device=samples.device,
+    )
+    raw_increments = torch.full(
+        (dimension_count, basis_count),
+        1e-6,
+        dtype=samples.dtype,
+        device=samples.device,
+    )
+
+    tolerance = max(
+        1e-8,
+        10.0 * torch.finfo(samples.dtype).eps ** 0.5,
+    )
+    objective = _objective(
+        raw_increments,
+        quadratic,
+        cumulative_derivative_basis,
+        sample_count,
+    )
+    for iteration in range(max_iterations):
+        gradient, hessian = _objective_derivatives(
+            raw_increments,
+            quadratic,
+            cumulative_derivative_basis,
+            sample_count,
+        )
+        curvature = torch.maximum(
+            torch.ones(dimension_count, device=samples.device),
+            torch.diagonal(hessian, dim1=1, dim2=2).abs().mean(dim=1),
+        )
+        damping = 1e-8 * curvature
+        selected = torch.zeros(
+            dimension_count,
+            dtype=torch.bool,
+            device=samples.device,
+        )
+        direction = torch.zeros_like(raw_increments)
+        for _ in range(12):
+            candidate = torch.linalg.solve(
+                hessian + damping[:, None, None] * identity,
+                -gradient.unsqueeze(2),
+            ).squeeze(2)
+            valid = (
+                torch.isfinite(candidate).all(dim=1)
+                & ((gradient * candidate).sum(dim=1) < 0)
+                & ~selected
+            )
+            direction = torch.where(valid[:, None], candidate, direction)
+            selected = selected | valid
+            damping = torch.where(selected, damping, damping * 10.0)
+            if bool(torch.all(selected)):
+                break
+        if not bool(torch.all(selected)):
+            raise RuntimeError("could not find a descent direction")
+
+        objective_tolerance = (
+            10.0
+            * torch.finfo(samples.dtype).eps
+            * torch.maximum(torch.ones_like(objective), objective.abs())
+        )
+        slope = (gradient * direction).sum(dim=1)
+        accepted = torch.zeros_like(selected)
+        step = torch.ones_like(objective)
+        accepted_step = torch.zeros_like(step)
+        for _ in range(25):
+            candidate = raw_increments + step[:, None] * direction
+            candidate_objective = _objective(
+                candidate,
+                quadratic,
+                cumulative_derivative_basis,
+                sample_count,
+            )
+            accept = (
+                torch.isfinite(candidate_objective)
+                & (
+                    candidate_objective
+                    <= objective + 1e-4 * step * slope + objective_tolerance
+                )
+                & ~accepted
+            )
+            raw_increments = torch.where(
+                accept[:, None],
+                candidate,
+                raw_increments,
+            )
+            objective = torch.where(
+                accept,
+                candidate_objective,
+                objective,
+            )
+            accepted_step = torch.where(accept, step, accepted_step)
+            accepted = accepted | accept
+            step = torch.where(accepted, step, step * 0.5)
+            if bool(torch.all(accepted)):
+                break
+        if not bool(torch.all(accepted)):
+            raise RuntimeError("line search failed")
+
+        if (iteration + 1) % 10 == 0 and iteration + 1 < max_iterations:
+            changes = torch.linalg.vector_norm(
+                accepted_step[:, None] * direction,
+                dim=1,
+            )
+            sizes = torch.linalg.vector_norm(raw_increments, dim=1)
+            if bool(torch.all(changes <= tolerance * (1.0 + sizes))):
+                break
+
+    coefficients = _coefficients(raw_increments).detach()
+    polynomial_coefficients = _polynomial_coefficients(knots, coefficients)
+    _, unpenalized_hessian = _objective_derivatives(
+        raw_increments,
+        transformed_gram,
+        cumulative_derivative_basis,
+        1,
+    )
+    _, penalized_hessian = _objective_derivatives(
+        raw_increments,
+        transformed_gram + transformed_smoothing,
+        cumulative_derivative_basis,
+        1,
+    )
+    ridge = 1e-8 * torch.maximum(
+        torch.ones(dimension_count, device=samples.device),
+        torch.diagonal(
+            penalized_hessian,
+            dim1=1,
+            dim2=2,
+        )
+        .abs()
+        .mean(dim=1),
+    )
+    effective_dof = torch.diagonal(
+        torch.linalg.solve(
+            penalized_hessian + ridge[:, None, None] * identity,
+            unpenalized_hessian,
+        ),
+        dim1=1,
+        dim2=2,
+    ).sum(dim=1)
+    mapped = torch.bmm(
+        design_by_dimension,
+        coefficients.unsqueeze(2),
+    ).squeeze(2)
+    derivatives = torch.bmm(
+        derivative_by_dimension,
+        coefficients.unsqueeze(2),
+    ).squeeze(2)
+    nll = 0.5 * mapped.square().sum(dim=1) - torch.log(derivatives).sum(dim=1)
+    correction = (
+        effective_dof
+        * (effective_dof + 1.0)
+        / torch.clamp(
+            sample_count - effective_dof - 1.0,
+            min=1e-12,
+        )
+    )
+    return _FitBatch(
+        knots=knots,
+        raw_coefficients=raw_increments.detach(),
+        polynomial_coefficients=polynomial_coefficients.detach(),
+        effective_dof=effective_dof.detach(),
+        aicc=(2.0 * (nll + effective_dof + correction)).detach(),
+        nll=nll.detach(),
+        left_values=torch.sum(left_design[0] * coefficients, dim=1),
+        right_values=torch.sum(right_design[0] * coefficients, dim=1),
+        left_derivatives=torch.sum(
+            left_derivative_design[0] * coefficients,
+            dim=1,
+        ),
+        right_derivatives=torch.sum(
+            right_derivative_design[0] * coefficients,
+            dim=1,
+        ),
+        log_smoothing=samples.new_full((dimension_count,), log_smoothing),
+    )
+
+
+def _fit_adaptive_batch(
+    samples: Tensor,
+    mean: Tensor,
+    scale: Tensor,
+    max_iterations: int,
+) -> _FitBatch:
+    candidates = [
+        _fit_batch(
+            samples,
+            mean,
+            scale,
+            max_iterations,
+            log_smoothing,
+        )
+        for log_smoothing in (-2.0, 2.0, 6.0)
+    ]
+    selected = torch.argmin(
+        torch.stack([candidate.aicc for candidate in candidates]),
+        dim=0,
+    )
+    dimensions = torch.arange(samples.shape[1], device=samples.device)
+
+    def choose(name: str) -> Tensor:
+        stacked = torch.stack(
+            [getattr(candidate, name) for candidate in candidates],
+            dim=0,
+        )
+        return stacked[selected, dimensions]
+
+    return _FitBatch(
+        knots=choose("knots"),
+        raw_coefficients=choose("raw_coefficients"),
+        polynomial_coefficients=choose("polynomial_coefficients"),
+        effective_dof=choose("effective_dof"),
+        aicc=choose("aicc"),
+        nll=choose("nll"),
+        left_values=choose("left_values"),
+        right_values=choose("right_values"),
+        left_derivatives=choose("left_derivatives"),
+        right_derivatives=choose("right_derivatives"),
+        log_smoothing=choose("log_smoothing"),
+    )
+
+
+class BatchedDiagonalSplineTransport(nn.Module):
+    """Cubic P-spline transport for about 12,000 independent parameters.
+
+    Input tensors have shape ``(samples, parameters)``. Fitting and map
+    evaluation stay on the input device.
+    """
+
+    _buffer_names = (
+        "mean_",
+        "scale_",
+        "knots_",
+        "raw_coefficients_",
+        "polynomial_coefficients_",
+        "interval_offsets_",
+        "effective_dof_",
+        "aicc_",
+        "nll_",
+        "left_values_",
+        "right_values_",
+        "left_derivatives_",
+        "right_derivatives_",
+        "log_smoothing_",
+    )
+
+    def __init__(
+        self,
+        *,
+        max_fit_iterations: int = _DEFAULT_FIT_ITERATIONS,
+    ) -> None:
+        super().__init__()
+        if max_fit_iterations < 1:
+            raise ValueError("max_fit_iterations must be at least 1")
+        self.max_fit_iterations = max_fit_iterations
+        for name in self._buffer_names:
+            self.register_buffer(name, None)
+        self.register_buffer("_placement_", torch.empty(0), persistent=False)
+        self._placement_requested = False
+        self.n_samples_seen_: int | None = None
+        self.n_features_in_: int | None = None
+
+    def _apply(self, fn: Any, recurse: bool = True) -> BatchedDiagonalSplineTransport:
+        result = super()._apply(fn, recurse=recurse)
+        self._placement_requested = True
+        return result
+
+    def get_extra_state(self) -> dict[str, int | None]:
+        return {
+            "n_samples_seen": self.n_samples_seen_,
+            "n_features_in": self.n_features_in_,
+            "max_fit_iterations": self.max_fit_iterations,
+        }
+
+    def set_extra_state(self, state: Mapping[str, Any]) -> None:
+        self.n_samples_seen_ = state["n_samples_seen"]
+        self.n_features_in_ = state["n_features_in"]
+        self.max_fit_iterations = state.get(
+            "max_fit_iterations",
+            self.max_fit_iterations,
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        for name in self._buffer_names:
+            key = f"{prefix}{name}"
+            if key in state_dict and (
+                getattr(self, name) is None
+                or getattr(self, name).shape != state_dict[key].shape
+            ):
+                saved = state_dict[key]
+                if self._placement_requested:
+                    dtype = (
+                        self._placement_.dtype
+                        if saved.is_floating_point()
+                        else saved.dtype
+                    )
+                    setattr(
+                        self,
+                        name,
+                        torch.empty(
+                            saved.shape,
+                            dtype=dtype,
+                            device=self._placement_.device,
+                        ),
+                    )
+                else:
+                    setattr(self, name, torch.empty_like(saved))
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if (
+            self.polynomial_coefficients_ is None
+            and self.knots_ is not None
+            and self.raw_coefficients_ is not None
+        ):
+            coefficients = _coefficients(self.raw_coefficients_)
+            self.polynomial_coefficients_ = _polynomial_coefficients(
+                self.knots_,
+                coefficients,
+            )
+            self.interval_offsets_ = (
+                torch.arange(
+                    self.knots_.shape[0],
+                    device=self.knots_.device,
+                )
+                * self.polynomial_coefficients_.shape[1]
+            ).unsqueeze(0)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        self._require_fitted()
+        assert self.mean_ is not None
+        return self.mean_.dtype
+
+    @property
+    def device(self) -> torch.device:
+        self._require_fitted()
+        assert self.mean_ is not None
+        return self.mean_.device
+
+    def _require_fitted(self) -> None:
+        if self.mean_ is None or self.n_features_in_ is None:
+            raise RuntimeError("fit must be called before applying the transport")
+
+    def _validate_input(self, value: Tensor, name: str) -> None:
+        self._require_fitted()
+        if not isinstance(value, Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if value.ndim != 2 or value.shape[1] != self.n_features_in_:
+            raise ValueError(f"{name} must have shape (N, {self.n_features_in_})")
+        if value.device != self.device:
+            raise ValueError(
+                f"{name} is on {value.device}, but the transport is on {self.device}"
+            )
+        if value.dtype != self.dtype:
+            raise ValueError(
+                f"{name} has dtype {value.dtype}, but the transport uses {self.dtype}"
+            )
+
+    def fit(self, X: Tensor) -> BatchedDiagonalSplineTransport:
+        if not isinstance(X, Tensor):
+            raise TypeError("X must be a torch.Tensor")
+        if not X.is_floating_point():
+            raise TypeError("X must have a floating-point dtype")
+        if X.ndim != 2:
+            raise ValueError("X must have shape (N, D)")
+        if not torch.all(torch.isfinite(X)):
+            raise ValueError("X must contain only finite values")
+
+        samples = X.detach()
+        sample_count, dimension_count = samples.shape
+        mean = samples.mean(dim=0)
+        scale = samples.std(dim=0, correction=0)
+        if torch.any(scale <= torch.finfo(samples.dtype).eps):
+            raise ValueError("every input dimension must have non-zero variance")
+
+        batches = [
+            _fit_adaptive_batch(
+                samples[:, start : start + _FIT_DIMENSION_BATCH_SIZE],
+                mean[start : start + _FIT_DIMENSION_BATCH_SIZE],
+                scale[start : start + _FIT_DIMENSION_BATCH_SIZE],
+                self.max_fit_iterations,
+            )
+            for start in range(0, dimension_count, _FIT_DIMENSION_BATCH_SIZE)
+        ]
+
+        self.n_samples_seen_ = sample_count
+        self.n_features_in_ = dimension_count
+        self.mean_ = mean
+        self.scale_ = scale
+        self.knots_ = torch.cat([batch.knots for batch in batches])
+        self.raw_coefficients_ = torch.cat(
+            [batch.raw_coefficients for batch in batches]
+        )
+        self.polynomial_coefficients_ = torch.cat(
+            [batch.polynomial_coefficients for batch in batches]
+        )
+        self.interval_offsets_ = (
+            torch.arange(dimension_count, device=samples.device)
+            * self.polynomial_coefficients_.shape[1]
+        ).unsqueeze(0)
+        self.effective_dof_ = torch.cat([batch.effective_dof for batch in batches])
+        self.aicc_ = torch.cat([batch.aicc for batch in batches])
+        self.nll_ = torch.cat([batch.nll for batch in batches])
+        self.left_values_ = torch.cat([batch.left_values for batch in batches])
+        self.right_values_ = torch.cat([batch.right_values for batch in batches])
+        self.left_derivatives_ = torch.cat(
+            [batch.left_derivatives for batch in batches]
+        )
+        self.right_derivatives_ = torch.cat(
+            [batch.right_derivatives for batch in batches]
+        )
+        self.log_smoothing_ = torch.cat(
+            [batch.log_smoothing for batch in batches]
+        )
+        return self
+
+    def select_dimension(self, dimension: int) -> BatchedDiagonalSplineTransport:
+        """Return one independently fitted dimension without retaining its batch."""
+        self._require_fitted()
+        assert self.n_features_in_ is not None
+        if dimension < 0 or dimension >= self.n_features_in_:
+            raise IndexError("dimension is out of range")
+
+        selected = BatchedDiagonalSplineTransport(
+            max_fit_iterations=self.max_fit_iterations
+        )
+        for name in self._buffer_names:
+            if name == "interval_offsets_":
+                continue
+            value = getattr(self, name)
+            assert value is not None
+            setattr(selected, name, value[dimension : dimension + 1].clone())
+        assert selected.polynomial_coefficients_ is not None
+        selected.interval_offsets_ = torch.zeros(
+            (1, 1),
+            dtype=torch.long,
+            device=selected.polynomial_coefficients_.device,
+        )
+        selected.n_samples_seen_ = self.n_samples_seen_
+        selected.n_features_in_ = 1
+        return selected
+
+    def _evaluate(
+        self,
+        x: Tensor,
+        *,
+        with_derivatives: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
+        return self._evaluate_dimensions(
+            x,
+            start=0,
+            with_derivatives=with_derivatives,
+        )
+
+    def _evaluate_dimensions(
+        self,
+        x: Tensor,
+        *,
+        start: int,
+        with_derivatives: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
+        assert (
+            self.knots_ is not None
+            and self.raw_coefficients_ is not None
+            and self.polynomial_coefficients_ is not None
+            and self.interval_offsets_ is not None
+            and self.left_values_ is not None
+            and self.right_values_ is not None
+            and self.left_derivatives_ is not None
+            and self.right_derivatives_ is not None
+        )
+        dimensions = slice(start, start + x.shape[1])
+        knots = self.knots_[dimensions]
+        interval_offsets = self.interval_offsets_[:, dimensions]
+        left_values = self.left_values_[dimensions]
+        right_values = self.right_values_[dimensions]
+        left_derivatives = self.left_derivatives_[dimensions]
+        right_derivatives = self.right_derivatives_[dimensions]
+        left = knots[:, _DEGREE]
+        right = knots[:, -_DEGREE - 1]
+        bounded = torch.maximum(
+            torch.minimum(x, right.unsqueeze(0)),
+            left.unsqueeze(0),
+        )
+        values, derivatives = _polynomial_evaluate(
+            bounded,
+            knots,
+            self.polynomial_coefficients_,
+            interval_offsets,
+            with_derivatives=with_derivatives,
+        )
+
+        below = x < left.unsqueeze(0)
+        above = x > right.unsqueeze(0)
+        values = torch.where(
+            below,
+            left_values.unsqueeze(0)
+            + (x - left.unsqueeze(0)) * left_derivatives.unsqueeze(0),
+            values,
+        )
+        values = torch.where(
+            above,
+            right_values.unsqueeze(0)
+            + (x - right.unsqueeze(0)) * right_derivatives.unsqueeze(0),
+            values,
+        )
+        if derivatives is not None:
+            derivatives = torch.where(
+                below,
+                left_derivatives.unsqueeze(0),
+                derivatives,
+            )
+            derivatives = torch.where(
+                above,
+                right_derivatives.unsqueeze(0),
+                derivatives,
+            )
+        return values, derivatives
+
+    def forward(self, X: Tensor) -> Tensor:
+        self._validate_input(X, "X")
+        assert self.mean_ is not None and self.scale_ is not None
+        return self._evaluate(
+            (X - self.mean_) / self.scale_,
+            with_derivatives=False,
+        )[0]
+
+    def log_prob(self, X: Tensor) -> Tensor:
+        """Evaluate the fitted independent density for each row of ``X``."""
+        self._validate_input(X, "X")
+        assert self.mean_ is not None and self.scale_ is not None
+        standardized = (X - self.mean_) / self.scale_
+        reference, derivatives = self._evaluate(standardized)
+        assert derivatives is not None
+        if torch.any(derivatives <= 0):
+            raise RuntimeError("the fitted map has a non-positive derivative")
+        log_reference_density = -0.5 * (
+            reference.square() + math.log(2.0 * math.pi)
+        )
+        log_jacobian = torch.log(derivatives) - torch.log(self.scale_)
+        return (log_reference_density + log_jacobian).sum(dim=1)
+
+    def inverse(self, Z: Tensor) -> Tensor:
+        self._validate_input(Z, "Z")
+        return self._inverse_dimensions(Z, start=0)
+
+    def _inverse_suffix(self, Z: Tensor, start: int) -> Tensor:
+        self._require_fitted()
+        assert self.n_features_in_ is not None
+        if (
+            Z.ndim != 2
+            or start < 0
+            or start > self.n_features_in_
+            or Z.shape[1] != self.n_features_in_ - start
+        ):
+            raise ValueError(
+                f"Z must have shape (N, {self.n_features_in_ - start})"
+            )
+        if Z.device != self.device or Z.dtype != self.dtype:
+            raise ValueError("Z and the transport must share device and dtype")
+        if Z.shape[1] == 0:
+            return Z.clone()
+        return self._inverse_dimensions(Z, start=start)
+
+    def _inverse_dimensions(self, Z: Tensor, *, start: int) -> Tensor:
+        assert (
+            self.knots_ is not None
+            and self.mean_ is not None
+            and self.scale_ is not None
+            and self.left_values_ is not None
+            and self.right_values_ is not None
+            and self.left_derivatives_ is not None
+            and self.right_derivatives_ is not None
+        )
+        dimensions = slice(start, start + Z.shape[1])
+        knots = self.knots_[dimensions]
+        interval_offsets = self.interval_offsets_[:, dimensions]
+        mean = self.mean_[dimensions]
+        scale = self.scale_[dimensions]
+        left_values = self.left_values_[dimensions]
+        right_values = self.right_values_[dimensions]
+        left_derivatives = self.left_derivatives_[dimensions]
+        right_derivatives = self.right_derivatives_[dimensions]
+        left = knots[:, _DEGREE]
+        right = knots[:, -_DEGREE - 1]
+        epsilon = 100.0 * torch.finfo(Z.dtype).eps
+        invalid_tail_slope = (left_derivatives <= epsilon) | (
+            right_derivatives <= epsilon
+        )
+        if torch.any(invalid_tail_slope):
+            raise RuntimeError("the fitted map has a non-positive tail slope")
+
+        below = Z < left_values.unsqueeze(0)
+        above = Z > right_values.unsqueeze(0)
+        low = left.unsqueeze(0).expand_as(Z)
+        high = right.unsqueeze(0).expand_as(Z)
+        middle = left.unsqueeze(0) + (right - left).unsqueeze(0) * (
+            (Z - left_values.unsqueeze(0))
+            / (right_values - left_values).unsqueeze(0)
+        )
+        middle = torch.maximum(
+            torch.minimum(middle, right.unsqueeze(0)),
+            left.unsqueeze(0),
+        )
+
+        iterations = 24 if Z.dtype == torch.float32 else 40
+        for iteration in range(min(_INVERSE_ITERATIONS, iterations)):
+            values, slopes = _polynomial_evaluate(
+                middle,
+                knots,
+                self.polynomial_coefficients_,
+                interval_offsets,
+            )
+            assert slopes is not None
+            low = torch.where(values < Z, middle, low)
+            high = torch.where(values >= Z, middle, high)
+            root_tolerance = (
+                4.0 * torch.finfo(Z.dtype).eps * (1.0 + middle.abs()) * slopes.abs()
+            )
+            converged = below | above | ((values - Z).abs() <= root_tolerance)
+            if (iteration + 1) % 4 == 0 and bool(torch.all(converged)):
+                break
+            newton = middle - (values - Z) / slopes
+            valid = (
+                torch.isfinite(newton)
+                & (slopes > epsilon)
+                & (newton >= low)
+                & (newton <= high)
+            )
+            middle = torch.where(valid, newton, 0.5 * (low + high))
+
+        left_tail = left.unsqueeze(0) + (
+            Z - left_values.unsqueeze(0)
+        ) / left_derivatives.unsqueeze(0)
+        right_tail = right.unsqueeze(0) + (
+            Z - right_values.unsqueeze(0)
+        ) / right_derivatives.unsqueeze(0)
+        result = torch.where(below, left_tail, middle)
+        result = torch.where(above, right_tail, result)
+
+        root = result.detach()
+        root_value, root_slope = self._evaluate_dimensions(root, start=start)
+        assert root_slope is not None
+        standardized = root + (Z - root_value) / root_slope.detach()
+        return standardized * scale + mean
+
+    @property
+    def coefficients_(self) -> Tensor:
+        self._require_fitted()
+        assert self.raw_coefficients_ is not None
+        return self.raw_coefficients_

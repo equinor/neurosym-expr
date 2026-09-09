@@ -1,0 +1,24 @@
+{
+  "results": [
+    {
+      "model": "adaptive-p-spline",
+      "seed": 0,
+      "ensemble_size": 50,
+      "steps": 5,
+      "spinup_steps": 50,
+      "mean_rmse": 0.17111163335671714,
+      "mean_crps": 0.09979371099564709,
+      "duration_seconds": 1.866383958957158
+    },
+    {
+      "model": "boosted-hard-tree",
+      "seed": 0,
+      "ensemble_size": 50,
+      "steps": 5,
+      "spinup_steps": 50,
+      "mean_rmse": 0.2529427035444036,
+      "mean_crps": 0.1355183504401612,
+      "duration_seconds": 38.950923083000816
+    }
+  ]
+}

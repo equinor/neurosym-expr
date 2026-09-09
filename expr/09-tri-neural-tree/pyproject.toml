@@ -1,0 +1,27 @@
+[project]
+name = "nine"
+version = "0.1.0"
+description = "Boosted triangular transports with hard P-spline and soft neural-spline trees"
+readme = "README.md"
+authors = [
+    { name = "Bjarte Johansen", email = "bjajoh@equinor.com" }
+]
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "numpy>=2.5.3",
+    "torch>=2.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+]
+
+[project.scripts]
+nine = "nine:main"
+nine-benchmarks = "nine.paper_benchmarks:main"
+nine-lorenz63 = "nine.lorenz63_benchmark:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
