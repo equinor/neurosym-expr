@@ -150,3 +150,49 @@ component to a causal window of preceding coordinates. For example,
 `BoostedHardTreeTransport(max_parent_distance=256)` avoids a dense global
 parent screen while preserving triangularity. Leave it as `None` when the
 ordering does not imply local dependence.
+
+## Online LLM activation steering
+
+The `nine-online-steering` experiment keeps the language model frozen and
+learns one temporary additive residual-stream vector for each question. It
+first samples unsteered answer trajectories with model thinking disabled,
+forms a low-rank basis from
+their layer activations, and then searches that basis with antithetic
+perturbations:
+
+\[
+h'_{\ell,t}=h_{\ell,t}+v_q.
+\]
+
+The same vector is applied to the final sequence position at the selected
+decoder layer during every generation step. It is never written into model
+parameters and is discarded after the question. The search score combines an
+answer score with a first-token output-KL penalty and rejects unfinished
+answers that hit the generation limit. By default, a separate unsteered model
+pass scores candidate answers as `Yes` versus `No`.
+
+```bash
+uv run nine-online-steering \
+  "If a train travels 60 km in 45 minutes, what is its average speed?" \
+  --layer -8 \
+  --exploration-samples 12 \
+  --rank 4 \
+  --iterations 2 \
+  --pairs 4 \
+  --vector-output steering-vector.pt \
+  --output steering-result.json
+```
+
+For controlled experiments, `--score exact --expected-answer 80` uses a known
+answer. This is an oracle upper bound rather than a deployable scoring method.
+`--score entropy` reproduces confidence-seeking behavior as a baseline.
+`--proposal transport` optionally fits `BoostedSoftTreeTransport` to elite
+low-dimensional coefficient vectors; it deliberately does not fit a
+full-dimensional transport to a handful of activations.
+
+The command reports the best initial sample, an equal-compute unsteered
+baseline, and the final steered answer. Use
+`--skip-equal-compute-baseline` only for faster exploratory runs. Density or
+confidence is not evidence of correctness, so steering results should be
+compared against equal-compute sampling and evaluated on tasks with external
+or executable answers.
