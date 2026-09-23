@@ -1,6 +1,25 @@
 # -*- mode: org -*-
 
-[2026-09-07 Mon]
+* [2026-09-23 Wed]
+
+[16:21]
+
+List of interesting paper:
+ - https://arxiv.org/html/2505.12540v4 Harnessing the Universal Geometry of Embeddings
+ - https://arxiv.org/html/2502.05171v2 Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach
+ - https://arxiv.org/html/2305.00633v3 Self-Evaluation Guided Beam Search for Reasoning
+ - https://arxiv.org/html/2505.17373v1 Value-Guided Search for Efficient Chain-of-Thought Reasoning
+ - https://arxiv.org/html/2604.15557v1 Predicting Where Steering Vectors Succeed
+ - https://arxiv.org/html/2305.10601v2 Tree of Thoughts: Deliberate Problem Solving with Large Language Models
+ - https://arxiv.org/html/2606.08454v1 Beyond Linear Activation Steering: Invertible Latent Transformations for Controlling LLM Behavior
+ - https://arxiv.org/html/1906.00031v3 Greedy inference with structure-exploiting lazy maps
+ - https://arxiv.org/html/2510.04871v1 Less is More: Recursive Reasoning with Tiny Networks
+ - https://arxiv.org/html/2412.06769v4 Training Large Language Models to Reason in a Continuous Latent Space
+ - https://transformer-circuits.pub/2026/workspace/index.html Verbalizable Representations Form a Global Workspace in Language Models
+ - https://dream-rsi.com Dream-RSI: Recursive Self-Improvement through Evolving Worlds
+
+
+* [2026-09-07 Mon]
 
 [15:40]
 
@@ -24,7 +43,7 @@ our parameters for weighting each region for the steering of our tokens?
 
 
 
-[2026-09-01 Tue]
+* [2026-09-01 Tue]
 
 [14:06]
 
