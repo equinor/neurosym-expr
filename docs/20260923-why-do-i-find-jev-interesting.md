@@ -170,12 +170,12 @@ model we need the model to keep the information about the probability
 distribution of what it has been trained on. However, the models are
 literally trained to be as confident they can be in all predictions.
 If we want to investigate the true confidence a model has in its
-output, we need to sample form it many times. This can get very
+output, we need to sample from it many times. This can get very
 expensive when you are trying to automate the processing of millions
 of document.
 
 TypeSafe.ai seems to have been struggling with all of these issues and
-thinking about how can we make AI more robust? How can we make the
+thinking about how can we make AI more robust. How can we make the
 uncertainty of a model cheap to calculate so that it can be used in
 automated decision making? How can we make decisions fast?
 
@@ -205,13 +205,12 @@ solve this task? What order do they need to be asked in? Before we
 would have to make a classifier for each of the questions we wanted to
 ask or use an autogregressive model that becomes slower and more
 costly the more branches there are in the process. It can also be
-difficult to say something about the performance or at what rate does
+difficult to say something about the performance or at what rate
 the different parts fail.
 
 The Jev approach allows us to iterate faster and focus on the details
 of the problem; and since we get a view of the uncertainty we can know
 at what points we need to put more effort.
-
 
 # How do I believe Jev is implemented?
 
@@ -229,8 +228,8 @@ TypeSafe.ai's API introduces 2 concepts: state and questions.
 The state is an object that you want to ask questions over. It can be
 a single string or a JSON object (where all values are strings).
 
-If you read the API it becomes a point that this can be a JSON object
-and different questions can filter on that object, but this is not
+If you read the API it becomes clear that the output can be a JSON object
+and that different questions can filter on that object, but this is not
 important to the inner workings of the model. To simplify the
 description we will just consider the state as the document we want to
 ask questions about.
@@ -282,14 +281,13 @@ quite sure that their base model is, infact, some kind of
 attention-based transformer model. Probably based on an open weight
 model.
 
-What a
-[transformer](https://poloclub.github.io/transformer-explainer/) does
-is to first embed the input tokens, the token embeddings are then
-processed through multi-head attention. Each head has learned what
+A [transformer](https://poloclub.github.io/transformer-explainer/) first
+embeds the input tokens and then processes the resulting embeddings through
+multi-head attention. Each head has learned what
 part of the embedding to attend to and how to relate that information
 to the task it is solving. It is not always possible to say what an
 attention head is trying to solve, but it could be something abstract
-like which name the pronouns in the document are referring to--Without
+like which name the pronouns in the document are referring to. Without
 going too deep in the transformer architecture, each attention layer
 consists of a query, key, and value. The key and value can be
 [cached](https://alechelbling.com/visualizations/kv-cache/) (KV cache)
@@ -365,7 +363,7 @@ also lead to a combinatorial explosion if we would train it for every
 option.
 
 I said earlier that I believe there is only one primitive
-categorisation function. There might be slightt variances in the
+categorisation function. There might be slight variances in the
 reward function that considers the type, but all of them use the
 categorisation tokens to make the decision.
 
