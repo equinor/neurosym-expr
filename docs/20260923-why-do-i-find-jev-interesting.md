@@ -2,7 +2,7 @@
 
 > Author: Bjarte Johansen Date: 23. September 2026
 
-Last week [TypeSafe.ai](https://typesafe.ai) released Jev. A
+Not long ago [TypeSafe.ai](https://typesafe.ai) released Jev. A
 recontextualisation of an old idea: Natural Language Processing (NLP)
 as classification. This is how most NLP tasks were solved before GPT.
 Information extraction was sequence classification/tagging and most
@@ -14,23 +14,24 @@ that could be trained to solve more than one task at a time.
 
 The ["Attention is all you
 need"-paper](https://proceedings.neurips.cc/paper_files/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf)
-was the catalyst for changing that, but it didn't happen over night.
-The first transformer models introduced in the attention paper were a
-generalisation and parallelisation of the attention mechanism that was
-already being used in other formalisations of language modeling. The
-most popular architecture at the time being
+was the catalyst for changing that, but the change didn't happen over
+night. The first transformer models introduced in the attention paper
+were a generalisation and parallelisation of the attention mechanism
+that was already being used in other formalisations of language
+modeling. The most popular architecture at the time being
 [LSTMs](https://en.wikipedia.org/wiki/Long_short-term_memory). The
 first models using the transformer architecture, like
 [BERT](https://arxiv.org/abs/1810.04805), were pretrained models that
-we then finetune for a specific task.
+we then finetuned for a specific task.
 
 This was a pretty powerful shift. We could now take a model that was
 first trained to predict next token probabilities through unsupervised
 learning on general text and then continue to train the model on a
 specific NLP task. Categorisation got re-framed as classification over
-the embedding of a class token/ The token was added to the input
-sequence so that the class token could "attend" to the full sequence
-and capture the true class through training.
+the embedding of a class token. The token was added to the input
+sequence so that the class token could "attend" to the full token
+sequence and learn how to pick out the neccessary information to make
+the correct classification.
 
 The same model could also be finetuned to produce a sequence of
 tokens, or words, through autoregressive generation. Autoregressive
@@ -69,10 +70,11 @@ forcing or suggesting that the model should follow a grammar: F.ex,
 you can say that through the token generation the model can only
 output a next token if it continues to be a valid python program (up
 to that token). The issue with this approach is that the next valid
-python token might be a low probability token. This can take the
-model out into uncertain areas of the model [latent space](https://en.wikipedia.org/wiki/Latent_space) and even
-though the program is valid syntactically, it can still be
-semantically invalid and hallucinated.
+python token might be a low probability token. This can take the model
+out into uncertain areas of the model [latent
+space](https://en.wikipedia.org/wiki/Latent_space), and even though
+the program is valid syntactically, it can still be semantically
+invalid and hallucinated.
 
 The latent space of a language model is where the model represents our
 input by long sequences of numbers (or vectors).
@@ -104,12 +106,11 @@ training the model through reinforcement learning to find a way to
 move the model parameters into a configuration that will answer your
 question.
 
-Through the
-manipulation of the latent representation of our input, the model finds
-an area in the latent space that has a high probability to answer your
-question. It then decodes this new position into a token that we can
-read. It does this until it runs out of space or it decodes a position
-that tells the process to stop.
+Through the manipulation of the latent representation of our input,
+the model finds an area in the latent space that has a high
+probability to answer your question. It then decodes this new position
+into a token that we can read. It does this until it runs out of space
+or it decodes a position that tells the process to stop.
 
 Normally when we train a model to learn a task we give it one and one
 example and check if it can confidently complete the task. If it
@@ -131,18 +132,32 @@ explicitly require an expected result. It instead reformulates
 learning as a game. It strictly only requires a way to define actions
 that can be taken as a transition between states and a way to measure
 if the goal has been achieved. The model then learns a policy, or a
-set of actions, it can take to achieve the goal. Normally, to avoid
-situations where the learner starts very far away from the goal, and
-RL can collapse into a random search, we add a reward function that
-tells our model if it is moving in the right direction. Hopefully we
-can find a reward function that is always correct, but most often the
-reward function is a heuristic that we believe will let the model move
-towards our goal.
+set of actions, it can take to achieve the goal.
+
+
+If the learner starts far enough away from the goal, RL can collapse
+into doing a random search over the actions and we might not be able
+to find a policy within reasonable time. To solve this problem we can
+add a rawrd function that tells our model if it is moving in the right
+direction. Hopefully we can find a reward function that rewards the
+correct behaviour,, but most often the reward function is a heuristic
+that we believe will let the model move towards our goal.
 
 When we train reasoning models we set the goal as the correct answer
 to a question, the actions the model can take are generating a token
-and the reward function measures closeness to the target output after
-we stop reasoning and generate a text.
+and the reward function mesures how close the model is to answering
+the question. How to measure closeness and give a reward is not
+trivial. It is pretty easy to make an ambigous reward function that
+makes the model learn the wrong behaviour. F.ex a coding agent might
+change a test instead of implementing the correct solution to a coding
+problem. This is called [reward
+hacking](https://lilianweng.github.io/posts/2024-11-28-reward-hacking/)
+and has a long history of research connected to it.
+
+For ChatGPT, OpenAI used [Reinforcement Learning from Human
+Feedback](https://arxiv.org/abs/2504.12501) to learn how to give
+responses that better align with how users rank different responses to
+the same question.
 
 To actually calculate the update to the model you need a critic to
 evaluate the actions and which parameters should update. The critic
@@ -165,14 +180,14 @@ representation of the training goal as high as possible. Logits are
 the unnormalised values the model produces that are turned into
 normalized probability values for the tokens.
 
- If we want to be able to know and represent the uncertainty of the
+If we want to be able to know and represent the uncertainty of the
 model we need the model to keep the information about the probability
 distribution of what it has been trained on. However, the models are
 literally trained to be as confident they can be in all predictions.
 If we want to investigate the true confidence a model has in its
 output, we need to sample from it many times. This can get very
 expensive when you are trying to automate the processing of millions
-of document.
+of documents.
 
 TypeSafe.ai seems to have been struggling with all of these issues and
 thinking about how can we make AI more robust. How can we make the
@@ -220,7 +235,7 @@ its output categories--it is also cheap. Fast means that a query takes
 a short time to compute (they claim 70-500ms end-to-end), parallel
 means that it can calculate the answer to many questions about the
 same input at the same time, and calibrated means that you do not
-just get the models categorisation; you also get to know the
+only get the models categorisation; you also get to know the
 uncertainty of the categorisation.
 
 TypeSafe.ai's API introduces 2 concepts: state and questions.
@@ -232,7 +247,7 @@ If you read the API it becomes clear that the output can be a JSON object
 and that different questions can filter on that object, but this is not
 important to the inner workings of the model. To simplify the
 description we will just consider the state as the document we want to
-ask questions about.
+ask questions over.
 
 The API describes 3 types of questions: choice, score, and noul. They
 claim these as primitives, but as we will see--I believe there
@@ -281,9 +296,9 @@ quite sure that their base model is, infact, some kind of
 attention-based transformer model. Probably based on an open weight
 model.
 
-A [transformer](https://poloclub.github.io/transformer-explainer/) first
-embeds the input tokens and then processes the resulting embeddings through
-multi-head attention. Each head has learned what
+A [transformer](https://poloclub.github.io/transformer-explainer/)
+first embeds the input tokens and then processes the resulting
+embeddings through multi-head attention. Each head has learned what
 part of the embedding to attend to and how to relate that information
 to the task it is solving. It is not always possible to say what an
 attention head is trying to solve, but it could be something abstract
@@ -291,19 +306,21 @@ like which name the pronouns in the document are referring to. Without
 going too deep in the transformer architecture, each attention layer
 consists of a query, key, and value. The key and value can be
 [cached](https://alechelbling.com/visualizations/kv-cache/) (KV cache)
-and reused along the causal axis of the transformer processing path,
-i.e. from the first token to the last. Why I say that it is causal is
-because the next token cannot affect the value of any of the previous
-tokens, it can only affect the value result of the next token.
+and reused along the causal axis of the
+([decoder-only](https://cameronrwolfe.substack.com/p/decoder-only-transformers-the-workhorse))
+transformer processing path, i.e. from the first token to the last.
+Why I say that it is causal is because the next token cannot affect
+the value of any of the previous tokens, it can only affect the value
+result of the next token.
 
 The reason I mention this is that I believe this is how Jev allows for
-the parallel processing of questions. They compute the KV cache and it
-can be propagated along each question in parallel; without any question
-affecting the result of any of the other questions. This also means
-that we do not have to train the model to learn to answer (virtually)
-more than 1 question at a time. This saves us having to teach the
-model how to differentiate between different questions and answers
-because the model only ever sees one at a time.
+the parallel processing of questions. They compute the KV cache for
+the input state and it can be propagated along each question in
+parallel; without any question affecting the result of any of the
+other questions. This means that we do not have to train the model to
+learn to answer (virtually) more than 1 question at a time. This saves
+us having to teach the model how to differentiate between different
+questions and answers because the model only ever sees one at a time.
 
 I believe there are two options for how the model makes a decision.
 The first is that there could be a feed-forward neural network that
@@ -316,27 +333,24 @@ in BERT to finetune for specific classification tasks.
 The reason why I believe there are 256 tokens is that you want to have
 a way to relate the options and the answer. What I would do in the
 serialisation of the question is to add one of these tokens to the
-beginning of the each option. It will also allow us to filter the
-token logit output to just the 256 classification tokens. I would also
-allow the output token to attend to the full network instead of just
-the last hidden state.
+beginning of each option. This makes it possible to filter the token
+logit output to just the 256 classification tokens and the output can
+attend to the full network instead of just the last hidden state.
 
-Since we don't have to process more than one question at a time, we
-also only have to output one token as we are only giving one answer
-and that token is a strict choice between the (current) classification
-tokens. This is how Jev is fast. It doesn't have to go through the
-autogregressive step(s) to output token by token and only processes
-forward through the network once.
+Since we do not have to process more than one question at a time, we
+just have to output 1 token pr question. This is how Jev is fast. It
+doesn't have to go through the autogregressive step(s) to output token
+by token and only processes forward through the network once.
 
 Since we also have the probability of each of the potential tokens, we
 can calculate the confidence that the top probability is correct. This
-is also where TypeSafe.ai's point about SFT, RLHF, and RLVR comes in.
-These techniques will result in very "spiky" logits around the
-training target and it will not give a good representation of what the
+is where TypeSafe.ai's point about SFT, RLHF, and RLVR comes in. These
+techniques will result in very "spiky" logits around the training
+target and it will not give a good representation of what the
 distribution is. The reason this happens is because the training is
 explicitly trying to maximize the logits of correct answers and is not
-trying to calibrate for the potential that the prediction is wrong. Many
-have tried to use the logits as a measure of confidence (ex.
+trying to calibrate for the potential that the prediction is wrong.
+Many have tried to use the logits as a measure of confidence (ex.
 [1](https://arxiv.org/abs/2205.09310),
 [2](https://arxiv.org/abs/2305.15508),
 [3](https://proceedings.mlr.press/v216/ye23a.html)), but every choice
