@@ -2,15 +2,17 @@
 
 > Author: Bjarte Johansen Date: 23. September 2026
 
-Not long ago [TypeSafe.ai](https://typesafe.ai) released Jev. A
-recontextualisation of an old idea: Natural Language Processing (NLP)
-as classification. This is how most NLP tasks were solved before GPT.
-Information extraction was sequence classification/tagging and most
-other tasks were picking between a set of categories--there are a few
-outliers like translation and summarisation. Chatbots and
-conversational AI was seen as fringe research. The reason being that
-we didn't know how to generalise language modeling and have models
-that could be trained to solve more than one task at a time.
+On 15. september [TypeSafe.ai release
+Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev).
+A recontextualisation of an old idea: Natural Language Processing
+(NLP) as classification. This is how most NLP tasks were solved before
+GPT and generalized language models. Information extraction was
+sequence classification/tagging and most other tasks were picking
+between a set of categories--except a few outliers like translation
+and summarisation. Chatbots and conversational AI was seen as fringe
+research: We didn't really know how to generalise language modeling
+and have models that could be trained to solve more than one task at a
+time.
 
 The ["Attention is all you
 need"-paper](https://proceedings.neurips.cc/paper_files/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf)
@@ -27,8 +29,8 @@ we then finetuned for a specific task.
 This was a pretty powerful shift. We could now take a model that was
 first trained to predict next token probabilities through unsupervised
 learning on general text and then continue to train the model on a
-specific NLP task. Categorisation got re-framed as classification over
-the embedding of a class token. The token was added to the input
+specific NLP task. Categorisation became re-framed as classification
+over the embedding of a class token. The token was added to the input
 sequence so that the class token could "attend" to the full token
 sequence and learn how to pick out the neccessary information to make
 the correct classification.
@@ -71,7 +73,7 @@ you can say that through the token generation the model can only
 output a next token if it continues to be a valid python program (up
 to that token). The issue with this approach is that the next valid
 python token might be a low probability token. This can take the model
-out into uncertain areas of the model [latent
+out into uncertain areas of the model's [latent
 space](https://en.wikipedia.org/wiki/Latent_space), and even though
 the program is valid syntactically, it can still be semantically
 invalid and hallucinated.
@@ -123,7 +125,7 @@ LLMs, this is called [Supervised Fine-Tuning
 relies on
 [backpropagation](https://en.wikipedia.org/wiki/Backpropagation) and
 [gradient descent](https://en.wikipedia.org/wiki/Gradient_descent).
-SFT needs examples of the given task where we have annotated our
+SFT needs examples of the given task where we have annotated the
 expected result.
 
 [Reinforcement learning
@@ -138,10 +140,10 @@ set of actions, it can take to achieve the goal.
 If the learner starts far enough away from the goal, RL can collapse
 into doing a random search over the actions and we might not be able
 to find a policy within reasonable time. To solve this problem we can
-add a rawrd function that tells our model if it is moving in the right
-direction. Hopefully we can find a reward function that rewards the
-correct behaviour,, but most often the reward function is a heuristic
-that we believe will let the model move towards our goal.
+add a reward function that tells our model if it is moving in the
+right direction. Hopefully we can find a reward function that rewards
+exactly the correct behaviour, but most often the reward function is a
+heuristic that we believe will let the model move towards our goal.
 
 When we train reasoning models we set the goal as the correct answer
 to a question, the actions the model can take are generating a token
@@ -159,15 +161,15 @@ Feedback](https://arxiv.org/abs/2504.12501) to learn how to give
 responses that better align with how users rank different responses to
 the same question.
 
-To actually calculate the update to the model you need a critic to
-evaluate the actions and which parameters should update. The critic
-model would be approximately the same size as the model you were
-training. It was DeepSeek who showed us [Group Relative Policy
-Optimization (GRPO)](https://arxiv.org/pdf/2402.03300) and a way to
-remove the critic from the learning process and we saw an explosion in
-reasoning models and their performance as GRPO opened up the
-possibility training the models through Reinforcement Learning with
-Verifiable Rewards (RLVR).
+To actually update the parameters of the model, you need a critic to
+evaluate the actions and which parameters should update. IN the
+beginning, the critic model would be approximately the same size as
+the model you were training. It was DeepSeek who showed us [Group
+Relative Policy Optimization (GRPO)](https://arxiv.org/pdf/2402.03300)
+and a way to remove the critic from the learning process and we saw an
+explosion in reasoning models their performance. We could now use GRPO
+to train the models through Reinforcement Learning with Verifiable
+Rewards (RLVR).
 
 One of the key problems that all of these methods are pointing to is
 that it is very difficult to, and actually
@@ -178,21 +180,24 @@ but in how they represent their token probabilities as well. The
 training goals of the model in SFT and RLVR is to force the logit
 representation of the training goal as high as possible. Logits are
 the unnormalised values the model produces that are turned into
-normalized probability values for the tokens.
+normalized probability values for next token generation.
 
 If we want to be able to know and represent the uncertainty of the
-model we need the model to keep the information about the probability
-distribution of what it has been trained on. However, the models are
-literally trained to be as confident they can be in all predictions.
-If we want to investigate the true confidence a model has in its
-output, we need to sample from it many times. This can get very
+model, we need the model to keep the information that concerns the
+probability distribution of what it has been trained on. However, the
+models are literally trained to be as confident they can be in all
+predictions. If we want to investigate the true confidence a model has
+in its output, we need to sample from it many times. This can get very
 expensive when you are trying to automate the processing of millions
-of documents.
+of documents. The value we get from checking the confidence is also
+questionable as it has been train for high confidence, not accurate
+representation.
 
 TypeSafe.ai seems to have been struggling with all of these issues and
-thinking about how can we make AI more robust. How can we make the
-uncertainty of a model cheap to calculate so that it can be used in
-automated decision making? How can we make decisions fast?
+thinking about how can we make AI more robust with respect to
+uncertainty. How can we make the uncertainty of a model cheap to
+calculate so that it can be used in automated decision making? How can
+we make decisions fast?
 
 Autoregression is inherently slow as every token is dependent on the
 previous tokens. SFT, RLHF, and RLVF are problematic because we lose
@@ -211,17 +216,21 @@ about reinforcement learning and scaling to generalise categorisation?
 Many (or maybe even most) NLP tasks can be thought of as
 categorisation tasks and instead of finetuning a specific model to
 solve a task, we can just zero- or few-shot learn any categorisation
-task.
+task. This seems like an obvious idea at first and almost strange that
+it hadn't been tried before, but I think there were several ideas that
+had to be connected to be able to reach a model calibrated for
+expressing uncertainty.
 
 Another reason why I like this approach is that it gives a framework
 for how to think about and solve problems. It makes you ask the
 question: What are the smallest and simplest questions I can ask to
-solve this task? What order do they need to be asked in? Before we
-would have to make a classifier for each of the questions we wanted to
-ask or use an autogregressive model that becomes slower and more
-costly the more branches there are in the process. It can also be
-difficult to say something about the performance or at what rate
-the different parts fail.
+solve this task? What order do they need to be asked in?
+
+Before, we would have to make a classifier for each of the questions
+we wanted to ask or use an autogregressive model that becomes slower
+and more costly the more branches there are in the process. It can
+also be difficult to say something about the performance or at what
+rate the different parts fail.
 
 The Jev approach allows us to iterate faster and focus on the details
 of the problem; and since we get a view of the uncertainty we can know
@@ -241,13 +250,14 @@ uncertainty of the categorisation.
 TypeSafe.ai's API introduces 2 concepts: state and questions.
 
 The state is an object that you want to ask questions over. It can be
-a single string or a JSON object (where all values are strings).
+a single string or a JSON object (where all leaf values are
+representable as strings).
 
-If you read the API it becomes clear that the output can be a JSON object
-and that different questions can filter on that object, but this is not
-important to the inner workings of the model. To simplify the
-description we will just consider the state as the document we want to
-ask questions over.
+If you read the API it becomes clear that the output can be a JSON
+object and that different questions can filter on that object, but
+this is not important to the inner workings of the model. To simplify
+the description we will just consider the state as the document we
+want to ask questions over.
 
 The API describes 3 types of questions: choice, score, and noul. They
 claim these as primitives, but as we will see--I believe there
@@ -293,8 +303,8 @@ they are "primarily a data research lab." Though I think there might
 be some new ways of thinking about how to process the questions in
 parallel and how to get information out of a transformer model, I am
 quite sure that their base model is, infact, some kind of
-attention-based transformer model. Probably based on an open weight
-model.
+attention-based transformer model or diffusion model. Probably based
+on an open weight model.
 
 A [transformer](https://poloclub.github.io/transformer-explainer/)
 first embeds the input tokens and then processes the resulting
@@ -302,9 +312,10 @@ embeddings through multi-head attention. Each head has learned what
 part of the embedding to attend to and how to relate that information
 to the task it is solving. It is not always possible to say what an
 attention head is trying to solve, but it could be something abstract
-like which name the pronouns in the document are referring to. Without
-going too deep in the transformer architecture, each attention layer
-consists of a query, key, and value. The key and value can be
+like which name the pronouns in the document are referring to.
+
+Without going too deep in the transformer architecture, each attention
+layer consists of a query, key, and value. The key and value can be
 [cached](https://alechelbling.com/visualizations/kv-cache/) (KV cache)
 and reused along the causal axis of the
 ([decoder-only](https://cameronrwolfe.substack.com/p/decoder-only-transformers-the-workhorse))
@@ -325,8 +336,8 @@ questions and answers because the model only ever sees one at a time.
 I believe there are two options for how the model makes a decision.
 The first is that there could be a feed-forward neural network that
 takes the last hidden state of the transformer and has an output of
-256 categories. The second, which is the more likely one in my
-opinion, is that they have added 256 new special tokens to the
+256 categories. The second--which is the more likely one in my
+opinion--is that they have added 256 new special tokens to the
 transformer. This is very similar to how we used to use the CLS token
 in BERT to finetune for specific classification tasks.
 
@@ -344,7 +355,7 @@ by token and only processes forward through the network once.
 
 Since we also have the probability of each of the potential tokens, we
 can calculate the confidence that the top probability is correct. This
-is where TypeSafe.ai's point about SFT, RLHF, and RLVR comes in. These
+is where TypeSafe.ai's point about SFT, RLHF, and RLVR comes in: These
 techniques will result in very "spiky" logits around the training
 target and it will not give a good representation of what the
 distribution is. The reason this happens is because the training is
@@ -398,10 +409,11 @@ the context as markers for the actual questions. It gives the model a
 target and an easy optimisation path. This could also be one of the
 motivations for the strict schema: So they can put their special
 tokens in the right place. There could be more special tokens that
-mark the begining of the state or instructions etc. They would do this
-to help the model reach an optimum faster as you are able to keep more
-of the structural information and do not have to learn that for every
-possible way a user of TypeSafe.ai could think of using their model.
+mark the beginning of the state or instructions etc. They would do
+this to help the model reach an optimum faster as you are able to keep
+more of the structural information and do not have to learn a new
+structure for every possible way a user of TypeSafe.ai could think of
+to use their model.
 
 The last problem that we have to solve is that large penalties for
 being confidently wrong might lead to overfitting and eventual model
@@ -415,9 +427,8 @@ model, we want the weights to form a less spiky latent space
 model too fast we might do better on one question, but we destroy the
 models ability to evaluate the next question.
 
-We have to regularise the parameter update, but there is already a
-known technique to deal with this problem: [Kullback–Leibler
-divergence
+We have to regularise the parameter update. There is already a known
+technique to deal with this problem: [Kullback–Leibler divergence
 penality](https://mbrenndoerfer.com/writing/kl-divergence-penalty-rlhf-training).
 Kullback-Leibler divergence measure the distance between two
 probability distributions and it can be used as a penalisation in RL.
@@ -438,7 +449,7 @@ remove the need for the "Unknown" token (that I believe is there).
 
 # A fast way to implement Jev
 
-We could take an open weight model, add 256 tokens, freeze the weight
+We could take an open weight model, add 256 tokens, freeze the weights
 (except we should probably learn the embeddings for the 256 tokens),
 use [Low-Rank Adaption (LoRA)](https://arxiv.org/abs/2106.09685) to
 reduce the number of learnable parameters, and train it through GRPO
@@ -454,4 +465,21 @@ with a multilayer perceptron or something similar on the hidden state
 instead of the 256 tokens, but I don't believe this is very far away
 from the architecture of how Jev is implemented. They probably train
 the whole model and do not use LoRA. It might also be that it is a
-different model like diffusion model, but I doubt it.
+different model like a diffusion model, but I doubt it.
+
+# Questions on the future of Jev
+
+I think the decision model is here to stay. It provides structure and
+cheap implementation for very normal tasks. Cheap generalised
+categorisation is valuable to industrial applications because in these
+settings we often have little or no training data, and it is difficult
+to produce enough to do proper testing. with generalised
+categorisation we can test the feasability and do focused data
+labelling on the parts of the problem where the model does poorly or
+has low confidence.
+
+Generalised categorisation does, however, open the question: Can we do
+generalised information extration as well? Can we do fast and cheap
+sequence labelling? TypeSafe.ai has already shown that their model can
+[find an object in an image](https://docs.typesafe.ai/primitives/box).
+Why couldn't we do the same for text or other media?
