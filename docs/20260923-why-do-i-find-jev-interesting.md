@@ -37,7 +37,7 @@ the correct classification.
 
 The same model could also be finetuned to produce a sequence of
 tokens, or words, through autoregressive generation. Autoregressive
-means that you uses the previous tokens that the model has generated
+means that you use the previous tokens that the model has generated
 as input to the next token generation.
 
 OpenAI then showed us with ChatGPT that if we just trained on large
@@ -136,7 +136,6 @@ that can be taken as a transition between states and a way to measure
 if the goal has been achieved. The model then learns a policy, or a
 set of actions, it can take to achieve the goal.
 
-
 If the learner starts far enough away from the goal, RL can collapse
 into doing a random search over the actions and we might not be able
 to find a policy within reasonable time. To solve this problem we can
@@ -162,12 +161,12 @@ responses that better align with how users rank different responses to
 the same question.
 
 To actually update the parameters of the model, you need a critic to
-evaluate the actions and which parameters should update. IN the
+evaluate the actions and which parameters should update. In the
 beginning, the critic model would be approximately the same size as
 the model you were training. It was DeepSeek who showed us [Group
 Relative Policy Optimization (GRPO)](https://arxiv.org/pdf/2402.03300)
 and a way to remove the critic from the learning process and we saw an
-explosion in reasoning models their performance. We could now use GRPO
+explosion in reasoning models and their performance. We could now use GRPO
 to train the models through Reinforcement Learning with Verifiable
 Rewards (RLVR).
 
@@ -185,12 +184,12 @@ normalized probability values for next token generation.
 If we want to be able to know and represent the uncertainty of the
 model, we need the model to keep the information that concerns the
 probability distribution of what it has been trained on. However, the
-models are literally trained to be as confident they can be in all
+models are literally trained to be as confident as they can be in all
 predictions. If we want to investigate the true confidence a model has
 in its output, we need to sample from it many times. This can get very
 expensive when you are trying to automate the processing of millions
 of documents. The value we get from checking the confidence is also
-questionable as it has been train for high confidence, not accurate
+questionable as it has been trained for high confidence, not accurate
 representation.
 
 TypeSafe.ai seems to have been struggling with all of these issues and
@@ -209,10 +208,11 @@ Calibrated Decisions, or [Calibrated
 Confidence](https://arxiv.org/html/2503.02623v6), and [strictly proper
 scoring rules](https://sites.stat.washington.edu/raftery/Research/PDF/Gneiting2007jasa.pdf).
 
-Their innovation lies in the observation that we generalised NLP
-through language models, but they are slow and costly. What if we used
-the parts of the same technology, and the new things we have learned
-about reinforcement learning and scaling to generalise categorisation?
+Their innovation builds on the observation that language models let us
+generalise across NLP tasks, but autoregressive generation can be slow and costly.
+What if we used parts of the same technology, together with what we have learned
+about reinforcement learning and scaling, to generalise categorisation?
+
 Many (or maybe even most) NLP tasks can be thought of as
 categorisation tasks and instead of finetuning a specific model to
 solve a task, we can just zero- or few-shot learn any categorisation
@@ -229,8 +229,9 @@ solve this task? What order do they need to be asked in?
 Before, we would have to make a classifier for each of the questions
 we wanted to ask or use an autogregressive model that becomes slower
 and more costly the more branches there are in the process. It can
-also be difficult to say something about the performance or at what
-rate the different parts fail.
+also be difficult to estimate how likely each decision is to be wrong,
+making it harder to know which results need further validation or
+human review.
 
 The Jev approach allows us to iterate faster and focus on the details
 of the problem; and since we get a view of the uncertainty we can know
@@ -289,7 +290,7 @@ choices and 10 levels on a score.
 believe they have a hidden "I do not know" category that they add to
 all choices. I think the reason is the same reason we do that when we
 use autogregressive models to do categorisation: So that you do not
-force the model to set a category when non of them fit. Especially
+force the model to set a category when none of them fit. Especially
 since the goal of Jev is to arrive at a generalised categorisation
 model.
 
@@ -430,7 +431,7 @@ models ability to evaluate the next question.
 We have to regularise the parameter update. There is already a known
 technique to deal with this problem: [Kullback–Leibler divergence
 penality](https://mbrenndoerfer.com/writing/kl-divergence-penalty-rlhf-training).
-Kullback-Leibler divergence measure the distance between two
+Kullback-Leibler divergence measures the distance between two
 probability distributions and it can be used as a penalisation in RL.
 It makes sure that the model's fundamental behaviour stays
 intact--that the weights don't move away from their original positions
@@ -470,10 +471,10 @@ different model like a diffusion model, but I doubt it.
 # Questions on the future of Jev
 
 I think the decision model is here to stay. It provides structure and
-cheap implementation for very normal tasks. Cheap generalised
+cheap implementation for very common tasks. Cheap generalised
 categorisation is valuable to industrial applications because in these
 settings we often have little or no training data, and it is difficult
-to produce enough to do proper testing. with generalised
+to produce enough to do proper testing. With generalised
 categorisation we can test the feasability and do focused data
 labelling on the parts of the problem where the model does poorly or
 has low confidence.
